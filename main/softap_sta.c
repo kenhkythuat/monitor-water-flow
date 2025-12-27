@@ -15,6 +15,7 @@
 #include <sys/param.h>
 #include "cJSON.h"
 #include "mqtt_client.h"
+#include "ethernet_manager.h"
 
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
@@ -41,6 +42,159 @@ void wifi_init_ap(void);
 void wifi_init_sta(const char *ssid, const char *pass);
 void wifi_reset_to_ap_mode(void);
 httpd_handle_t start_webserver(void);
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data);
+
+// new
+static EventGroupHandle_t s_net_event_group;
+#define NET_WIFI_OK_BIT BIT0
+#define NET_ETH_OK_BIT BIT1
+
+typedef enum
+{
+    GW_STATE_BOOT = 0,
+    GW_STATE_NO_INTERNET,
+
+    GW_STATE_ETH_CONNECTING,
+    GW_STATE_ETH_ONLINE,
+
+    GW_STATE_WIFI_CONNECTING,
+    GW_STATE_WIFI_ONLINE,
+    GW_STATE_AP_MODE,
+
+    GW_STATE_MQTT_CONNECTING,
+    GW_STATE_MQTT_CONNECTED,
+
+    GW_STATE_SENDING_DATA,
+} gateway_state_t;
+
+static gateway_state_t g_state = GW_STATE_BOOT;
+
+static const char *gw_state_str(gateway_state_t s)
+{
+    switch (s)
+    {
+    case GW_STATE_BOOT:
+        return "BOOT";
+    case GW_STATE_NO_INTERNET:
+        return "NO_INTERNET";
+    case GW_STATE_ETH_CONNECTING:
+        return "ETH_CONNECTING";
+    case GW_STATE_ETH_ONLINE:
+        return "ETH_ONLINE";
+    case GW_STATE_WIFI_CONNECTING:
+        return "WIFI_CONNECTING";
+    case GW_STATE_WIFI_ONLINE:
+        return "WIFI_ONLINE";
+    case GW_STATE_AP_MODE:
+        return "AP_MODE";
+    case GW_STATE_MQTT_CONNECTING:
+        return "MQTT_CONNECTING";
+    case GW_STATE_MQTT_CONNECTED:
+        return "MQTT_CONNECTED";
+    case GW_STATE_SENDING_DATA:
+        return "SENDING_DATA";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void gateway_set_state(gateway_state_t s)
+{
+    if (g_state == s)
+        return;
+    g_state = s;
+    ESP_LOGI("GW", "STATE -> %s", gw_state_str(s));
+}
+
+static void mqtt_manager_start(void)
+{
+    if (mqtt_client)
+        return;
+
+    gateway_set_state(GW_STATE_MQTT_CONNECTING);
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://72.61.140.234:1883",
+        .credentials.username = "thuanphat",
+        .credentials.authentication.password = "123456789",
+        .credentials.client_id = "phat123",
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    if (!mqtt_client)
+    {
+        ESP_LOGE("MQTT", "Failed to init client");
+        return;
+    }
+
+    esp_mqtt_client_register_event(mqtt_client, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
+    esp_err_t err = esp_mqtt_client_start(mqtt_client);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE("MQTT", "Failed to start: %s", esp_err_to_name(err));
+        esp_mqtt_client_destroy(mqtt_client);
+        mqtt_client = NULL;
+        return;
+    }
+}
+
+static void mqtt_manager_stop(void)
+{
+    if (!mqtt_client)
+        return;
+    esp_mqtt_client_stop(mqtt_client);
+    esp_mqtt_client_destroy(mqtt_client);
+    mqtt_client = NULL;
+    ESP_LOGW("MQTT", "MQTT stopped (no internet)");
+}
+
+static void net_monitor_task(void *arg)
+{
+    bool last_eth_ip = false;
+
+    while (1)
+    {
+        bool eth_ip = ethernet_manager_has_ip();
+        if (eth_ip != last_eth_ip)
+        {
+            last_eth_ip = eth_ip;
+            if (eth_ip)
+                xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
+            else
+                xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+        }
+
+        EventBits_t b = xEventGroupGetBits(s_net_event_group);
+        bool any_net = (b & (NET_WIFI_OK_BIT | NET_ETH_OK_BIT));
+
+        if (!any_net)
+        {
+            gateway_set_state(GW_STATE_NO_INTERNET);
+            gpio_set_level(LED_RED_GPIO, 1);
+            gpio_set_level(LED_BLUE_GPIO, 0);
+            mqtt_manager_stop();
+        }
+        else
+        {
+            gpio_set_level(LED_RED_GPIO, 0);
+            gpio_set_level(LED_BLUE_GPIO, 1);
+
+            if (eth_ip)
+                gateway_set_state(GW_STATE_ETH_ONLINE);
+            else
+                gateway_set_state(GW_STATE_WIFI_ONLINE);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
+
+// off new
 
 /* ---------------- HTTP server handlers ---------------- */
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -238,12 +392,19 @@ static void mqtt_event_handler(void *handler_args,
 
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI("MQTT", "Connected to ThingsBoard");
+        gateway_set_state(GW_STATE_MQTT_CONNECTED);
 
         // Thêm subscribe cho topic command
         esp_mqtt_client_subscribe(event->client,
                                   "tbmq/cs_000001/port01/command", 0);
         ESP_LOGI("MQTT", "Subscribed to tbmq/cs_000001/port01/command");
 
+        break;
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI("MQTT", "Subscribed, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_BEFORE_CONNECT:
+        ESP_LOGI("MQTT", "Before connect");
         break;
 
     case MQTT_EVENT_PUBLISHED:
@@ -297,6 +458,13 @@ static void mqtt_event_handler(void *handler_args,
 
         break;
     }
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW("MQTT", "Disconnected");
+        break;
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE("MQTT", "Error");
+        break;
 
     default:
         ESP_LOGW("MQTT", "Other event id:%d", event->event_id);
@@ -307,38 +475,28 @@ static void mqtt_event_handler(void *handler_args,
 /* ---------------- MQTT Task ---------------- */
 static void mqtt_publish_task(void *pvParameters)
 {
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://72.61.140.234:1883",
-        .credentials.username = "thuanphat",
-        // .broker.address.uri = "mqtt://103.27.62.56:30883",
-        // .credentials.username = "f61WIi67MXugxAAP8WSw",
-        .credentials.authentication.password = "123456789",
-        .credentials.client_id = "phat123",
-        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
-    };
-
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    // --- Đăng ký callback nhận sự kiện MQTT ---
-    if (mqtt_client == NULL)
-    {
-        ESP_LOGE("MQTT", "Failed to init client");
-        vTaskDelete(NULL);
-        return;
-    }
-    esp_mqtt_client_register_event(mqtt_client, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
-    esp_err_t err = esp_mqtt_client_start(mqtt_client);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE("MQTT", "Failed to start client: %s", esp_err_to_name(err));
-        vTaskDelete(NULL);
-        return;
-    }
-
     while (1)
     {
-        // const char *topic = "tbmq/cs_000001/port01";
+        // Chờ có ít nhất 1 mạng OK (WiFi hoặc ETH)
+        xEventGroupWaitBits(s_net_event_group,
+                            NET_WIFI_OK_BIT | NET_ETH_OK_BIT,
+                            pdFALSE, pdFALSE,
+                            portMAX_DELAY);
+
+        // Có mạng -> đảm bảo MQTT chạy
+        mqtt_manager_start();
+
+        // Nếu MQTT chưa kịp tạo, chờ chút
+        if (!mqtt_client)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Publish
+        gateway_set_state(GW_STATE_SENDING_DATA);
         gpio_set_level(LED_GREEN_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(100)); // gửi mỗi 5 giây
+
         const char *topic = "tbmq/cs_000001/port01/telemetry";
         const char *payload = "\"voltage\": 48.5,\"current\": 6.2,\"energy\": 1.24";
         int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
@@ -346,13 +504,21 @@ static void mqtt_publish_task(void *pvParameters)
         if (msg_id >= 0)
         {
             ESP_LOGI("MQTT", "Published msg_id=%d", msg_id);
-            gpio_set_level(LED_GREEN_GPIO, 0);
+        }
+        else
+        {
+            ESP_LOGW("MQTT", "Publish failed");
         }
 
-        else
-            ESP_LOGW("MQTT", "Failed to publish");
+        gpio_set_level(LED_GREEN_GPIO, 0);
 
-        vTaskDelay(pdMS_TO_TICKS(5000)); // gửi mỗi 5 giây
+        // quay lại trạng thái “online” theo interface ưu tiên
+        if (ethernet_manager_has_ip())
+            gateway_set_state(GW_STATE_ETH_ONLINE);
+        else if (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT)
+            gateway_set_state(GW_STATE_WIFI_ONLINE);
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
@@ -365,12 +531,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         switch (event_id)
         {
         case WIFI_EVENT_STA_START:
+            gateway_set_state(GW_STATE_WIFI_CONNECTING);
             esp_wifi_connect();
             ESP_LOGI(TAG, "Wi-Fi STA started, connecting...");
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED:
             ESP_LOGW(TAG, "Wi-Fi disconnected");
+            xEventGroupClearBits(s_net_event_group, NET_WIFI_OK_BIT);
             if (mqtt_client)
             {
                 esp_mqtt_client_stop(mqtt_client);
@@ -394,6 +562,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 esp_restart();
             }
             break;
+        case IP_EVENT_STA_GOT_IP:
+            ESP_LOGE(TAG, "------case IP_EVENT_STA_GOT_IP---------");
+            xEventGroupSetBits(s_net_event_group, NET_WIFI_OK_BIT);
+            gateway_set_state(GW_STATE_WIFI_ONLINE);
+            gpio_set_level(LED_BLUE_GPIO, 1);
+
+            break;
 
         default:
             break;
@@ -404,15 +579,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
-        if (!mqtt_task_started)
-        {
-            mqtt_task_started = true;
-            xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
-            ESP_LOGI(TAG, "MQTT publish task started");
-        }
+        // ✅ quan trọng: báo “WiFi có internet”
+        xEventGroupSetBits(s_net_event_group, NET_WIFI_OK_BIT);
+
+        gateway_set_state(GW_STATE_WIFI_ONLINE);
+        gpio_set_level(LED_BLUE_GPIO, 1);
     }
+
 }
 
 /* ---------------- wifi init sta/ap/reset ---------------- */
@@ -462,7 +638,7 @@ void wifi_init_ap(void)
 
     wifi_config_t ap_config = {
         .ap = {
-            .ssid = "ESP32_Setup",
+            .ssid = "SETUP WIFI EV CHARGING STATION",
             .ssid_len = 0,
             .password = "",
             .max_connection = 4,
@@ -591,14 +767,28 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    s_net_event_group = xEventGroupCreate();
+    gateway_set_state(GW_STATE_BOOT);
+
+    // Start Ethernet trước (ưu tiên dây LAN nếu có)
+    gateway_set_state(GW_STATE_ETH_CONNECTING);
+    ESP_ERROR_CHECK(ethernet_manager_start());
+
     xTaskCreate(wifi_reset_button_task, "wifi_reset_button_task", 4096, NULL, 5, NULL);
     xTaskCreate(mqtt_ack_task, "mqtt_ack_task", 4096, NULL, 5, NULL);
+
+    // MQTT publish task tạo 1 lần từ boot (tự chờ internet)
+    xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
+
+    // Monitor mạng (ETH/WiFi) + quản lý state + stop mqtt khi mất internet
+    xTaskCreate(net_monitor_task, "net_monitor_task", 4096, NULL, 7, NULL);
 
     // load saved credentials
     nvs_handle_t nvs;
     char ssid[64] = {0}, pass[128] = {0};
     size_t ssid_len = sizeof(ssid), pass_len = sizeof(pass);
     esp_err_t ssid_ok = ESP_FAIL, pass_ok = ESP_FAIL;
+
     if (nvs_open("storage", NVS_READONLY, &nvs) == ESP_OK)
     {
         ssid_ok = nvs_get_str(nvs, "wifi_ssid", ssid, &ssid_len);
@@ -609,11 +799,13 @@ void app_main(void)
     if (ssid_ok == ESP_OK && ssid[0] != '\0')
     {
         ESP_LOGI(TAG, "Found saved Wi-Fi SSID: %s", ssid);
+        gateway_set_state(GW_STATE_WIFI_CONNECTING);
         wifi_init_sta(ssid, pass);
     }
     else
     {
         ESP_LOGI(TAG, "No saved Wi-Fi, starting in AP mode...");
+        gateway_set_state(GW_STATE_AP_MODE);
         wifi_init_ap();
     }
 }
