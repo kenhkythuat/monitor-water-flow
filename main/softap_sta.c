@@ -1,5 +1,8 @@
 // main.c
 #include <stdio.h>
+#include "gateway_state.h"
+#include "gateway_core.h"
+#include "status_led.h"
 #include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
@@ -22,9 +25,9 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
-#define LED_RED_GPIO 13
+#define LED_RED_GPIO 21
 #define LED_BLUE_GPIO 14
-#define LED_GREEN_GPIO 21
+#define LED_GREEN_GPIO 13
 
 static const char *TAG = "wifi_setup";
 static EventGroupHandle_t s_wifi_event_group;
@@ -52,63 +55,6 @@ static void mqtt_event_handler(void *handler_args,
 static EventGroupHandle_t s_net_event_group;
 #define NET_WIFI_OK_BIT BIT0
 #define NET_ETH_OK_BIT BIT1
-
-typedef enum
-{
-    GW_STATE_BOOT = 0,
-    GW_STATE_NO_INTERNET,
-
-    GW_STATE_ETH_CONNECTING,
-    GW_STATE_ETH_ONLINE,
-
-    GW_STATE_WIFI_CONNECTING,
-    GW_STATE_WIFI_ONLINE,
-    GW_STATE_AP_MODE,
-
-    GW_STATE_MQTT_CONNECTING,
-    GW_STATE_MQTT_CONNECTED,
-
-    GW_STATE_SENDING_DATA,
-} gateway_state_t;
-
-static gateway_state_t g_state = GW_STATE_BOOT;
-
-static const char *gw_state_str(gateway_state_t s)
-{
-    switch (s)
-    {
-    case GW_STATE_BOOT:
-        return "BOOT";
-    case GW_STATE_NO_INTERNET:
-        return "NO_INTERNET";
-    case GW_STATE_ETH_CONNECTING:
-        return "ETH_CONNECTING";
-    case GW_STATE_ETH_ONLINE:
-        return "ETH_ONLINE";
-    case GW_STATE_WIFI_CONNECTING:
-        return "WIFI_CONNECTING";
-    case GW_STATE_WIFI_ONLINE:
-        return "WIFI_ONLINE";
-    case GW_STATE_AP_MODE:
-        return "AP_MODE";
-    case GW_STATE_MQTT_CONNECTING:
-        return "MQTT_CONNECTING";
-    case GW_STATE_MQTT_CONNECTED:
-        return "MQTT_CONNECTED";
-    case GW_STATE_SENDING_DATA:
-        return "SENDING_DATA";
-    default:
-        return "UNKNOWN";
-    }
-}
-
-static void gateway_set_state(gateway_state_t s)
-{
-    if (g_state == s)
-        return;
-    g_state = s;
-    ESP_LOGI("GW", "STATE -> %s", gw_state_str(s));
-}
 
 static void mqtt_manager_start(void)
 {
@@ -175,15 +121,10 @@ static void net_monitor_task(void *arg)
         if (!any_net)
         {
             gateway_set_state(GW_STATE_NO_INTERNET);
-            gpio_set_level(LED_RED_GPIO, 1);
-            gpio_set_level(LED_BLUE_GPIO, 0);
             mqtt_manager_stop();
         }
         else
         {
-            gpio_set_level(LED_RED_GPIO, 0);
-            gpio_set_level(LED_BLUE_GPIO, 1);
-
             if (eth_ip)
                 gateway_set_state(GW_STATE_ETH_ONLINE);
             else
@@ -494,8 +435,8 @@ static void mqtt_publish_task(void *pvParameters)
         }
 
         // Publish
+        status_led_pulse_green(1000);
         gateway_set_state(GW_STATE_SENDING_DATA);
-        gpio_set_level(LED_GREEN_GPIO, 1);
 
         const char *topic = "tbmq/cs_000001/port01/telemetry";
         const char *payload = "\"voltage\": 48.5,\"current\": 6.2,\"energy\": 1.24";
@@ -509,9 +450,6 @@ static void mqtt_publish_task(void *pvParameters)
         {
             ESP_LOGW("MQTT", "Publish failed");
         }
-
-        gpio_set_level(LED_GREEN_GPIO, 0);
-
         // quay lại trạng thái “online” theo interface ưu tiên
         if (ethernet_manager_has_ip())
             gateway_set_state(GW_STATE_ETH_ONLINE);
@@ -546,7 +484,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 mqtt_client = NULL;
                 mqtt_task_started = false;
                 ESP_LOGI(TAG, "MQTT client stopped due to Wi-Fi lost");
-                gpio_set_level(LED_BLUE_GPIO, 0);
             }
 
             if (s_retry_num < 5)
@@ -562,14 +499,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 esp_restart();
             }
             break;
-        case IP_EVENT_STA_GOT_IP:
-            ESP_LOGE(TAG, "------case IP_EVENT_STA_GOT_IP---------");
-            xEventGroupSetBits(s_net_event_group, NET_WIFI_OK_BIT);
-            gateway_set_state(GW_STATE_WIFI_ONLINE);
-            gpio_set_level(LED_BLUE_GPIO, 1);
-
-            break;
-
         default:
             break;
         }
@@ -586,9 +515,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xEventGroupSetBits(s_net_event_group, NET_WIFI_OK_BIT);
 
         gateway_set_state(GW_STATE_WIFI_ONLINE);
-        gpio_set_level(LED_BLUE_GPIO, 1);
     }
-
 }
 
 /* ---------------- wifi init sta/ap/reset ---------------- */
@@ -622,7 +549,6 @@ void wifi_init_sta(const char *ssid, const char *pass)
     if (bits & WIFI_CONNECTED_BIT)
     {
         ESP_LOGI(TAG, "connected to AP success");
-        gpio_set_level(LED_BLUE_GPIO, 1);
     }
     else
     {
@@ -684,11 +610,9 @@ void wifi_reset_button_task(void *pvParameters)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE};
     gpio_config(&io_conf_in);
-
-    // --- Cấu hình GPIO10, 38, 39, 40 làm OUTPUT ---
     gpio_config_t io_conf_out = {
         .pin_bit_mask =
-            (1ULL << GPIO_NUM_10) | (1ULL << LED_RED_GPIO) | (1ULL << LED_BLUE_GPIO) | (1ULL << LED_GREEN_GPIO),
+            (1ULL << GPIO_NUM_10),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -697,9 +621,6 @@ void wifi_reset_button_task(void *pvParameters)
 
     // --- Đặt mức logic 1 cho GPIO10 ---
     gpio_set_level(GPIO_NUM_10, 1);
-    gpio_set_level(LED_RED_GPIO, 1);
-    gpio_set_level(LED_BLUE_GPIO, 0);
-    gpio_set_level(LED_GREEN_GPIO, 0);
 
     TickType_t press_start = 0;
     bool pressed = false;
@@ -768,11 +689,16 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     s_net_event_group = xEventGroupCreate();
-    gateway_set_state(GW_STATE_BOOT);
-
-    // Start Ethernet trước (ưu tiên dây LAN nếu có)
+    gateway_core_init(); 
+    status_led_cfg_t cfg = {
+        .red_gpio = LED_RED_GPIO,
+        .blue_gpio = LED_BLUE_GPIO,
+        .green_gpio = LED_GREEN_GPIO,
+        .active_high = false,
+    };
+    ESP_ERROR_CHECK(status_led_init(&cfg)); // ✅ tạo task LED trước
     gateway_set_state(GW_STATE_ETH_CONNECTING);
-    ESP_ERROR_CHECK(ethernet_manager_start());
+    esp_err_t err = ethernet_manager_start(); // nên bỏ ESP_ERROR_CHECK để khỏi reboot
 
     xTaskCreate(wifi_reset_button_task, "wifi_reset_button_task", 4096, NULL, 5, NULL);
     xTaskCreate(mqtt_ack_task, "mqtt_ack_task", 4096, NULL, 5, NULL);
