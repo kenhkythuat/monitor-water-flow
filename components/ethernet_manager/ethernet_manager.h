@@ -13,6 +13,8 @@ esp_err_t ethernet_manager_start(void);
 bool ethernet_manager_link_up(void);
 bool ethernet_manager_has_ip(void);
 esp_err_t ethernet_manager_get_ip(esp_netif_ip_info_t *out);
+esp_netif_t *ethernet_manager_get_netif(void);
+
 
 #ifdef __cplusplus
 }

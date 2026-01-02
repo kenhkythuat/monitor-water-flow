@@ -39,6 +39,7 @@ static char ack_id[64] = {0};
 
 static esp_mqtt_client_handle_t mqtt_client = NULL; // client toàn cục
 static bool mqtt_task_started = false;              // để tránh tạo nhiều lần
+static esp_netif_t *s_wifi_netif = NULL;
 
 // forward
 void wifi_init_ap(void);
@@ -103,37 +104,65 @@ static void net_monitor_task(void *arg)
 {
     bool last_eth_ip = false;
 
-    while (1)
-    {
-        bool eth_ip = ethernet_manager_has_ip();
-        if (eth_ip != last_eth_ip)
-        {
-            last_eth_ip = eth_ip;
-            if (eth_ip)
-                xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
-            else
-                xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+    while (1) {
+        bool eth_ip  = ethernet_manager_has_ip();
+        bool wifi_ip = (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT);
+
+        // ưu tiên ETH khi vừa có IP
+        if (eth_ip && !last_eth_ip) {
+            esp_netif_t *eth = ethernet_manager_get_netif();
+            if (eth) esp_netif_set_default_netif(eth);
+            gateway_set_state(GW_STATE_ETH_ONLINE);
         }
 
-        EventBits_t b = xEventGroupGetBits(s_net_event_group);
-        bool any_net = (b & (NET_WIFI_OK_BIT | NET_ETH_OK_BIT));
+        // nếu ETH mất IP mà WiFi còn -> fallback WiFi
+        if (!eth_ip && last_eth_ip && wifi_ip && s_wifi_netif) {
+            esp_netif_set_default_netif(s_wifi_netif);
+            gateway_set_state(GW_STATE_WIFI_ONLINE);
+        }
 
-        if (!any_net)
-        {
-            gateway_set_state(GW_STATE_NO_INTERNET);
-            mqtt_manager_stop();
-        }
-        else
-        {
-            if (eth_ip)
-                gateway_set_state(GW_STATE_ETH_ONLINE);
-            else
-                gateway_set_state(GW_STATE_WIFI_ONLINE);
-        }
+        last_eth_ip = eth_ip;
 
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
+
+
+// static void net_monitor_task(void *arg)
+// {
+//     bool last_eth_ip = false;
+
+//     while (1)
+//     {
+//         bool eth_ip = ethernet_manager_has_ip();
+//         if (eth_ip != last_eth_ip)
+//         {
+//             last_eth_ip = eth_ip;
+//             if (eth_ip)
+//                 xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
+//             else
+//                 xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+//         }
+
+//         EventBits_t b = xEventGroupGetBits(s_net_event_group);
+//         bool any_net = (b & (NET_WIFI_OK_BIT | NET_ETH_OK_BIT));
+
+//         if (!any_net)
+//         {
+//             gateway_set_state(GW_STATE_NO_INTERNET);
+//             mqtt_manager_stop();
+//         }
+//         else
+//         {
+//             if (eth_ip)
+//                 gateway_set_state(GW_STATE_ETH_ONLINE);
+//             else
+//                 gateway_set_state(GW_STATE_WIFI_ONLINE);
+//         }
+
+//         vTaskDelay(pdMS_TO_TICKS(300));
+//     }
+// }
 
 // off new
 
@@ -430,7 +459,7 @@ static void mqtt_publish_task(void *pvParameters)
         // Nếu MQTT chưa kịp tạo, chờ chút
         if (!mqtt_client)
         {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
@@ -523,7 +552,8 @@ void wifi_init_sta(const char *ssid, const char *pass)
 {
     s_wifi_event_group = xEventGroupCreate();
 
-    esp_netif_create_default_wifi_sta();
+    // esp_netif_create_default_wifi_sta();
+    s_wifi_netif = esp_netif_create_default_wifi_sta(); // ✅ lưu lại handle
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
