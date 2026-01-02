@@ -1,0 +1,21 @@
+# Name,      Type, SubType, Offset,   Size,     Flags
+# Notes:
+# - Flash 8MB = 0x800000
+# - Partition table @ 0x8000
+# - App partitions should be aligned to 0x10000
+# - Data partitions aligned to 0x1000
+
+nvs,        data, nvs,     0x9000,   0x6000
+otadata,    data, ota,     0xF000,   0x2000
+phy_init,   data, phy,     0x11000,  0x1000
+nvs_keys,   data, nvs_keys,0x12000,  0x4000
+
+# OTA app slots (each ~2.3125MB)
+ota_0,      app,  ota_0,   0x20000,  0x250000
+ota_1,      app,  ota_1,   0x270000, 0x250000
+
+# Optional: coredump (64KB)
+coredump,   data, coredump,0x4C0000, 0x10000
+
+# File system (SPIFFS) uses the rest (~3.1875MB)
+spiffs,     data, spiffs,  0x4D0000, 0x330000

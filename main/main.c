@@ -19,6 +19,7 @@
 #include "cJSON.h"
 #include "mqtt_client.h"
 #include "ethernet_manager.h"
+#include "modbus_pzem.h"
 
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
@@ -56,6 +57,9 @@ static void mqtt_event_handler(void *handler_args,
 static EventGroupHandle_t s_net_event_group;
 #define NET_WIFI_OK_BIT BIT0
 #define NET_ETH_OK_BIT BIT1
+
+// variable modbus_rtu form stm32
+static const uint8_t stm32_slaves[] = { 0x01 , /*0x02*/ };
 
 static void mqtt_manager_start(void)
 {
@@ -443,6 +447,23 @@ static void mqtt_event_handler(void *handler_args,
 }
 
 /* ---------------- MQTT Task ---------------- */
+
+void status_led_pulse_green(uint32_t ms);
+
+// Status theo từng PZEM (riêng biệt)
+static const char *pzem_status_str(const pzem_data_t *p)
+{
+    if (!p) return "unknown";
+
+    // ưu tiên báo lỗi nếu STM32 đánh dấu crc_fail
+    if (p->crc_fail) return "error";
+
+    // đơn giản: có dòng thì charging
+    if (p->current_a > 0.02f) return "charging";
+
+    return "idle";
+}
+
 static void mqtt_publish_task(void *pvParameters)
 {
     while (1)
@@ -463,29 +484,84 @@ static void mqtt_publish_task(void *pvParameters)
             continue;
         }
 
-        // Publish
-        status_led_pulse_green(1000);
-        gateway_set_state(GW_STATE_SENDING_DATA);
+        // Lấy số STM32 đang poll (theo stm32_slaves[] bạn khai báo)
+        uint8_t meter_cnt = modbus_pzem_get_meter_count();
 
-        const char *topic = "tbmq/cs_000001/port01/telemetry";
-        const char *payload = "\"voltage\": 48.5,\"current\": 6.2,\"energy\": 1.24";
-        int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-
-        if (msg_id >= 0)
+        // Với mỗi STM32: publish 2 lần (PZEM1->portX, PZEM2->portX+1)
+        for (uint8_t i = 0; i < meter_cnt; i++)
         {
-            ESP_LOGI("MQTT", "Published msg_id=%d", msg_id);
-        }
-        else
-        {
-            ESP_LOGW("MQTT", "Publish failed");
-        }
-        // quay lại trạng thái “online” theo interface ưu tiên
-        if (ethernet_manager_has_ip())
-            gateway_set_state(GW_STATE_ETH_ONLINE);
-        else if (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT)
-            gateway_set_state(GW_STATE_WIFI_ONLINE);
+            stm32_meter_t m;
+            if (!modbus_pzem_get_meter(i, &m)) continue;
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+            // port base theo thứ tự slave trong stm32_slaves[]
+            // i=0 -> base=1 => port01/port02
+            // i=1 -> base=3 => port03/port04
+            uint8_t port_base = (uint8_t)(i * 2 + 1);
+
+            // publish cho PZEM1 rồi PZEM2
+            for (uint8_t k = 0; k < 2; k++)
+            {
+                const pzem_data_t *p = (k == 0) ? &m.pzem1 : &m.pzem2;
+                uint8_t port_num = (uint8_t)(port_base + k);
+
+                char topic[128];
+                snprintf(topic, sizeof(topic),
+                         "tbmq/cs_000001/port%02u/telemetry", (unsigned)port_num);
+
+                // energy: Wh -> kWh để giống kiểu 1.24
+                float energy_kwh = p->energy_wh / 1000.0f;
+
+                const char *status = pzem_status_str(p);
+
+                char payload[256];
+                int len = snprintf(payload, sizeof(payload),
+                                   "{"
+                                     "\"data\":{"
+                                       "\"voltage\":%.1f,"
+                                       "\"current\":%.3f,"
+                                       "\"power\":%.1f,"
+                                       "\"energy\":%.3f,"
+                                       "\"status\":\"%s\""
+                                     "}"
+                                   "}",
+                                   p->voltage_v,
+                                   p->current_a,
+                                   p->power_w,
+                                   energy_kwh,
+                                   status);
+
+                if (len <= 0 || len >= (int)sizeof(payload))
+                {
+                    ESP_LOGW("MQTT", "Payload too long, skip meter_idx=%u port=%u", i, port_num);
+                    continue;
+                }
+
+                // Publish (giữ đúng style cũ)
+                status_led_pulse_green(1000);
+                gateway_set_state(GW_STATE_SENDING_DATA);
+
+                int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+
+                if (msg_id >= 0)
+                {
+                    ESP_LOGI("MQTT", "Published msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+                }
+                else
+                {
+                    ESP_LOGW("MQTT", "Publish failed topic=%s", topic);
+                }
+
+                // quay lại trạng thái “online” theo interface ưu tiên
+                if (ethernet_manager_has_ip())
+                    gateway_set_state(GW_STATE_ETH_ONLINE);
+                else if (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT)
+                    gateway_set_state(GW_STATE_WIFI_ONLINE);
+
+                vTaskDelay(pdMS_TO_TICKS(150)); // nhẹ broker
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); // chu kỳ gửi
     }
 }
 
@@ -738,6 +814,27 @@ void app_main(void)
 
     // Monitor mạng (ETH/WiFi) + quản lý state + stop mqtt khi mất internet
     xTaskCreate(net_monitor_task, "net_monitor_task", 4096, NULL, 7, NULL);
+
+        modbus_pzem_cfg_t mb = {
+        .rs485 = {
+            .uart_num = 2,
+            .tx_gpio = 10,
+            .rx_gpio = 12,
+            .de_gpio = 11,      // DE mapped to RTS
+            .baudrate = 9600,
+        },
+        .slave_ids = stm32_slaves,
+        .slave_count = sizeof(stm32_slaves),
+
+        .net_event_group = s_net_event_group,
+        .online_bits = NET_WIFI_OK_BIT | NET_ETH_OK_BIT,
+
+        .poll_period_ms = 5000,
+        .inter_request_ms = 100,
+    };
+
+    ESP_ERROR_CHECK(modbus_pzem_init(&mb));
+    ESP_ERROR_CHECK(modbus_pzem_start());
 
     // load saved credentials
     nvs_handle_t nvs;
