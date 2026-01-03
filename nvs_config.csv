@@ -1,0 +1,7 @@
+# Sample csv file
+key,type,encoding,value
+keyconfig,namespace,,
+devEui,data,string,07F0430D30DD0601
+appEui,data,string,0940AF0550C80601
+appKey,data,string,07F0430D30DD06013306D0CA0070230F
+

@@ -1,0 +1,6 @@
+# Sample csv file
+key,type,encoding,value
+nodeconfig,namespace
+device_id,data,string,"cs_000001"
+number_device,data,u32,5
+

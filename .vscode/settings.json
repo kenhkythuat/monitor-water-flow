@@ -1,12 +1,14 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
+  "idf.flashType": "UART",
+  "idf.portWin": "COM17",
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "detect",
+  // "idf.portWin": "detect",
   "idf.currentSetup": "c:\\Espressif\\frameworks\\esp-idf-v5.3.1",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
-  "idf.flashType": "JTAG"
+  // "idf.flashType": "JTAG"
 }

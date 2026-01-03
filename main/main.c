@@ -20,6 +20,7 @@
 #include "mqtt_client.h"
 #include "ethernet_manager.h"
 #include "modbus_pzem.h"
+#include "gateway_config.h"
 
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
@@ -653,7 +654,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                 ESP_LOGI(TAG, "MQTT client stopped due to Wi-Fi lost");
             }
 
-            if (s_retry_num < 5)
+            if (s_retry_num < 100)
             {
                 esp_wifi_connect();
                 s_retry_num++;
@@ -883,6 +884,7 @@ static void mqtt_cmd_task(void *arg)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(gateway_config_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
