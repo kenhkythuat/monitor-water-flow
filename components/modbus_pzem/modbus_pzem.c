@@ -12,6 +12,8 @@
 
 
 static const char *TAG = "modbus_pzem";
+static SemaphoreHandle_t s_uart_mutex;
+
 
 // ===================== CRC16 MODBUS =====================
 static uint16_t modbus_crc16(const uint8_t *buf, uint16_t len)
@@ -244,6 +246,13 @@ static void poll_one_slave(uint8_t slave_id)
     if (e2 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM2", 0x0010, regs2);
     else ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
 
+    xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
+    esp_err_t e3 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
+    vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
+    esp_err_t e4 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
+    xSemaphoreGive(s_uart_mutex);
+
+
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     // find meter slot
@@ -312,6 +321,9 @@ esp_err_t modbus_pzem_init(const modbus_pzem_cfg_t *cfg)
 
     if (!s_lock) s_lock = xSemaphoreCreateMutex();
     if (!s_lock) return ESP_ERR_NO_MEM;
+    if (!s_uart_mutex) s_uart_mutex = xSemaphoreCreateMutex();
+    if (!s_uart_mutex) return ESP_ERR_NO_MEM;
+
 
     ESP_ERROR_CHECK(rs485_uart_init(&s_cfg.rs485));
 
@@ -348,3 +360,74 @@ bool modbus_pzem_get_meter(uint8_t index, stm32_meter_t *out)
     xSemaphoreGive(s_lock);
     return true;
 }
+static esp_err_t modbus_write_single_reg_internal(uint8_t slave_id, uint16_t reg, uint16_t value, uint32_t timeout_ms)
+{
+    uint8_t req[8];
+    req[0] = slave_id;
+    req[1] = 0x06;
+    req[2] = (reg >> 8) & 0xFF;
+    req[3] = (reg >> 0) & 0xFF;
+    req[4] = (value >> 8) & 0xFF;
+    req[5] = (value >> 0) & 0xFF;
+
+    uint16_t crc = modbus_crc16(req, 6);
+    req[6] = crc & 0xFF;
+    req[7] = (crc >> 8) & 0xFF;
+
+    const int uartn = s_cfg.rs485.uart_num;
+
+    uart_flush_input(uartn);
+
+    ESP_LOGI(TAG, "MB TX FC06 slave=0x%02X reg=0x%04X val=0x%04X", slave_id, reg, value);
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, req, sizeof(req), ESP_LOG_INFO);
+
+    int w = uart_write_bytes(uartn, (const char*)req, sizeof(req));
+    ESP_ERROR_CHECK(uart_wait_tx_done(uartn, pdMS_TO_TICKS(200)));
+    if (w != (int)sizeof(req)) return ESP_FAIL;
+
+    // FC06 echo lại đúng 8 bytes
+    uint8_t rsp[8] = {0};
+    int r = uart_read_bytes(uartn, rsp, 8, pdMS_TO_TICKS(timeout_ms));
+    if (r != 8) {
+        ESP_LOGW(TAG, "MB RX timeout FC06 echo: got=%d/8", r);
+        if (r > 0) ESP_LOG_BUFFER_HEX_LEVEL(TAG, rsp, r, ESP_LOG_WARN);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG, "MB RX FC06 echo:");
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, rsp, 8, ESP_LOG_INFO);
+
+    uint16_t crc_calc = modbus_crc16(rsp, 6);
+    uint16_t crc_rx   = (uint16_t)rsp[6] | ((uint16_t)rsp[7] << 8);
+    if (crc_calc != crc_rx) return ESP_ERR_INVALID_CRC;
+
+    // verify echo
+    if (memcmp(req, rsp, 6) != 0) return ESP_FAIL;
+
+    return ESP_OK;
+}
+
+esp_err_t modbus_pzem_write_single_reg(uint8_t slave_id, uint16_t reg, uint16_t value)
+{
+    if (!s_uart_mutex) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
+    esp_err_t e = modbus_write_single_reg_internal(slave_id, reg, value, 300);
+    xSemaphoreGive(s_uart_mutex);
+    return e;
+}
+
+bool modbus_pzem_map_port_to_slave_reg(uint8_t port_num, uint8_t *out_slave, uint16_t *out_reg)
+{
+    if (!out_slave || !out_reg) return false;
+    if (port_num == 0) return false;
+
+    uint8_t idx = (uint8_t)((port_num - 1) / 2);   // 0,1,2...
+    uint8_t which = (uint8_t)((port_num - 1) % 2); // 0=PZEM1, 1=PZEM2
+
+    if (idx >= s_cfg.slave_count) return false;
+
+    *out_slave = s_cfg.slave_ids[idx];
+    *out_reg   = (which == 0) ? 0x0100 : 0x0101;
+    return true;
+}
+

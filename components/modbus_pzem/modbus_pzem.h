@@ -63,6 +63,13 @@ esp_err_t modbus_pzem_start(void);  // tạo task poll
 uint8_t modbus_pzem_get_meter_count(void);
 bool modbus_pzem_get_meter(uint8_t index, stm32_meter_t *out);
 
+// ghi 1 thanh ghi holding (FC06) tới slave/reg
+esp_err_t modbus_pzem_write_single_reg(uint8_t slave_id, uint16_t reg, uint16_t value);
+
+// map portXX -> slave_id + reg(0x0100/0x0101) theo danh sách stm32_slaves
+bool modbus_pzem_map_port_to_slave_reg(uint8_t port_num, uint8_t *out_slave, uint16_t *out_reg);
+
+
 #ifdef __cplusplus
 }
 #endif

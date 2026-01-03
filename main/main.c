@@ -60,6 +60,18 @@ static EventGroupHandle_t s_net_event_group;
 
 // variable modbus_rtu form stm32
 static const uint8_t stm32_slaves[] = { 0x01 , /*0x02*/ };
+typedef struct {
+    uint8_t port;      // port01..portNN
+    uint8_t slave;
+    uint16_t reg;
+    uint16_t value;
+    char cmd[24];
+    float max_current;
+    int timeout_s;
+} gw_cmd_t;
+
+static QueueHandle_t s_cmd_q;
+
 
 static void mqtt_manager_start(void)
 {
@@ -130,45 +142,6 @@ static void net_monitor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
-
-
-// static void net_monitor_task(void *arg)
-// {
-//     bool last_eth_ip = false;
-
-//     while (1)
-//     {
-//         bool eth_ip = ethernet_manager_has_ip();
-//         if (eth_ip != last_eth_ip)
-//         {
-//             last_eth_ip = eth_ip;
-//             if (eth_ip)
-//                 xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
-//             else
-//                 xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
-//         }
-
-//         EventBits_t b = xEventGroupGetBits(s_net_event_group);
-//         bool any_net = (b & (NET_WIFI_OK_BIT | NET_ETH_OK_BIT));
-
-//         if (!any_net)
-//         {
-//             gateway_set_state(GW_STATE_NO_INTERNET);
-//             mqtt_manager_stop();
-//         }
-//         else
-//         {
-//             if (eth_ip)
-//                 gateway_set_state(GW_STATE_ETH_ONLINE);
-//             else
-//                 gateway_set_state(GW_STATE_WIFI_ONLINE);
-//         }
-
-//         vTaskDelay(pdMS_TO_TICKS(300));
-//     }
-// }
-
-// off new
 
 /* ---------------- HTTP server handlers ---------------- */
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -354,6 +327,18 @@ httpd_handle_t start_webserver(void)
     }
     return server;
 }
+static bool parse_port_from_topic(const char *topic, uint8_t *out_port)
+{
+    // topic: tbmq/cs_000001/port01/command
+    const char *p = strstr(topic, "/port");
+    if (!p) return false;
+    p += 5; // skip "/port"
+    int port = atoi(p);
+    if (port <= 0 || port > 99) return false;
+    *out_port = (uint8_t)port;
+    return true;
+}
+
 static void mqtt_event_handler(void *handler_args,
                                esp_event_base_t base,
                                int32_t event_id,
@@ -369,10 +354,8 @@ static void mqtt_event_handler(void *handler_args,
         gateway_set_state(GW_STATE_MQTT_CONNECTED);
 
         // Thêm subscribe cho topic command
-        esp_mqtt_client_subscribe(event->client,
-                                  "tbmq/cs_000001/port01/command", 0);
-        ESP_LOGI("MQTT", "Subscribed to tbmq/cs_000001/port01/command");
-
+        esp_mqtt_client_subscribe(event->client, "tbmq/cs_000001/#", 0);
+        ESP_LOGI("MQTT", "Subscribed to tbmq/cs_000001/#");
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI("MQTT", "Subscribed, msg_id=%d", event->msg_id);
@@ -385,53 +368,132 @@ static void mqtt_event_handler(void *handler_args,
         ESP_LOGI("MQTT", "Published OK, msg_id=%d", event->msg_id);
         break;
 
-    case MQTT_EVENT_DATA:
+        case MQTT_EVENT_DATA:
+{
+    char topic_buf[128] = {0};
+    snprintf(topic_buf, sizeof(topic_buf), "%.*s", event->topic_len, event->topic);
+
+    char data_buf[512] = {0};
+    snprintf(data_buf, sizeof(data_buf), "%.*s", event->data_len, event->data);
+
+    ESP_LOGI("MQTT", "Received topic: %s", topic_buf);
+    ESP_LOGI("MQTT", "Received data : %s", data_buf);
+
+    // chỉ xử lý các topic command
+    if (strstr(topic_buf, "/command") != NULL)
     {
-        char topic_buf[128] = {0};
-        snprintf(topic_buf, sizeof(topic_buf),
-                 "%.*s", event->topic_len, event->topic);
-
-        char data_buf[256] = {0};
-        snprintf(data_buf, sizeof(data_buf),
-                 "%.*s", event->data_len, event->data);
-
-        ESP_LOGI("MQTT", "Received topic: %s", topic_buf);
-        ESP_LOGI("MQTT", "Received data : %s", data_buf);
-
-        /* =====================================================
-           XỬ LÝ TOPIC COMMAND → TẠO NHIỆM VỤ GỬI ACK
-           ===================================================== */
-        if (strcmp(topic_buf, "tbmq/cs_000001/port01/command") == 0)
+        uint8_t port = 0;
+        if (!parse_port_from_topic(topic_buf, &port))
         {
-            cJSON *json = cJSON_Parse(data_buf);
-            if (json)
-            {
-                cJSON *id = cJSON_GetObjectItem(json, "id");
-
-                if (cJSON_IsString(id) && id->valuestring != NULL)
-                {
-                    // Copy ID vào biến global
-                    strncpy(ack_id, id->valuestring, sizeof(ack_id) - 1);
-
-                    ack_flag = true;
-
-                    ESP_LOGI("MQTT", "Parsed CMD id=%s -> ACK queued", ack_id);
-                }
-                else
-                {
-                    ESP_LOGW("MQTT", "No valid \"id\" in command!");
-                }
-
-                cJSON_Delete(json);
-            }
-            else
-            {
-                ESP_LOGE("MQTT", "Invalid JSON payload!");
-            }
+            ESP_LOGW("MQTT", "Cannot parse port from topic=%s", topic_buf);
+            break;
         }
 
-        break;
+        cJSON *json = cJSON_Parse(data_buf);
+        if (!json)
+        {
+            ESP_LOGE("MQTT", "Invalid JSON payload!");
+            break;
+        }
+
+        /* =======================
+           1) GIỮ ACK LOGIC CŨ
+           ======================= */
+        cJSON *id = cJSON_GetObjectItem(json, "id");
+        if (cJSON_IsString(id) && id->valuestring != NULL)
+        {
+            strncpy(ack_id, id->valuestring, sizeof(ack_id) - 1);
+            ack_flag = true;
+            ESP_LOGI("MQTT", "Parsed CMD id=%s -> ACK queued", ack_id);
+        }
+        else
+        {
+            ESP_LOGW("MQTT", "No valid \"id\" in command!");
+        }
+
+        /* =======================
+           2) CMD NẰM TRONG payload
+           ======================= */
+        cJSON *payload = cJSON_GetObjectItem(json, "payload");
+        if (!cJSON_IsObject(payload))
+        {
+            ESP_LOGW("MQTT", "No valid \"payload\" object!");
+            cJSON_Delete(json);
+            break;
+        }
+
+        cJSON *cmd = cJSON_GetObjectItem(payload, "cmd");
+        if (!cJSON_IsString(cmd) || !cmd->valuestring)
+        {
+            ESP_LOGW("MQTT", "No valid \"cmd\" in command!");
+            cJSON_Delete(json);
+            break;
+        }
+
+        // param optional
+        float max_current = 0.0f;
+        int timeout_s = 0;
+
+        cJSON *param = cJSON_GetObjectItem(payload, "param");
+        if (cJSON_IsObject(param))
+        {
+            cJSON *mc = cJSON_GetObjectItem(param, "max_current");
+            cJSON *to = cJSON_GetObjectItem(param, "timeout");
+            if (cJSON_IsNumber(mc)) max_current = (float)mc->valuedouble;
+            if (cJSON_IsNumber(to)) timeout_s = to->valueint;
+        }
+
+        // map port -> slave/reg (0x0100/0x0101)
+        uint8_t slave = 0;
+        uint16_t reg = 0;
+        if (!modbus_pzem_map_port_to_slave_reg(port, &slave, &reg))
+        {
+            ESP_LOGW("MQTT", "Port%02u out of range (check stm32_slaves[])", port);
+            cJSON_Delete(json);
+            break;
+        }
+
+        // cmd -> value FC06
+        uint16_t value = 0x0000;
+        if (strcmp(cmd->valuestring, "start_charge") == 0)
+            value = 0x0003;   // relay ON + led ON
+        else if (strcmp(cmd->valuestring, "stop_charge") == 0)
+            value = 0x0000;   // OFF
+        else
+        {
+            ESP_LOGW("MQTT", "Unknown cmd=%s", cmd->valuestring);
+            cJSON_Delete(json);
+            break;
+        }
+
+        // enqueue command (không write modbus trong callback)
+        if (s_cmd_q)
+        {
+            gw_cmd_t c = {0};
+            c.port = port;
+            c.slave = slave;
+            c.reg = reg;
+            c.value = value;
+            c.max_current = max_current;
+            c.timeout_s = timeout_s;
+            strncpy(c.cmd, cmd->valuestring, sizeof(c.cmd) - 1);
+
+            if (xQueueSend(s_cmd_q, &c, 0) != pdTRUE)
+                ESP_LOGW("MQTT", "cmd queue full, drop port%02u cmd=%s", port, c.cmd);
+            else
+                ESP_LOGI("MQTT", "CMD queued: port%02u -> slave=0x%02X reg=0x%04X val=0x%04X (maxI=%.2f timeout=%ds)",
+                         port, slave, reg, value, max_current, timeout_s);
+        }
+        else
+        {
+            ESP_LOGW("MQTT", "s_cmd_q not init, drop command");
+        }
+
+        cJSON_Delete(json);
     }
+
+    break;
+}
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW("MQTT", "Disconnected");
         break;
@@ -787,6 +849,36 @@ void mqtt_ack_task(void *arg)
     }
 }
 
+static void mqtt_cmd_task(void *arg)
+{
+    gw_cmd_t c;
+    while (1) {
+        if (xQueueReceive(s_cmd_q, &c, portMAX_DELAY) != pdTRUE) continue;
+
+        ESP_LOGI("CMD", "Exec cmd=%s port%02u -> slave=0x%02X reg=0x%04X val=0x%04X maxI=%.2f timeout=%ds",
+                 c.cmd, c.port, c.slave, c.reg, c.value, c.max_current, c.timeout_s);
+
+        esp_err_t e = modbus_pzem_write_single_reg(c.slave, c.reg, c.value);
+        if (e == ESP_OK) {
+            ESP_LOGI("CMD", "OK cmd=%s port%02u", c.cmd, c.port);
+        } else {
+            ESP_LOGW("CMD", "FAIL cmd=%s port%02u err=%s", c.cmd, c.port, esp_err_to_name(e));
+        }
+
+        // (tuỳ bạn) publish ack lại server:
+        // tbmq/cs_000001/portXX/ack  {"cmd":"...","result":"ok/fail"}
+        if (mqtt_client) {
+            char topic[96];
+            char payload[128];
+            snprintf(topic, sizeof(topic), "tbmq/cs_000001/port%02u/ack", c.port);
+            snprintf(payload, sizeof(payload), "{\"cmd\":\"%s\",\"result\":\"%s\"}",
+                     c.cmd, (e==ESP_OK)?"ok":"fail");
+            esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+        }
+    }
+}
+
+
 /* ---------------- main ---------------- */
 void app_main(void)
 {
@@ -812,6 +904,10 @@ void app_main(void)
     // MQTT publish task tạo 1 lần từ boot (tự chờ internet)
     xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
 
+    s_cmd_q = xQueueCreate(10, sizeof(gw_cmd_t));
+    xTaskCreate(mqtt_cmd_task, "mqtt_cmd_task", 4096, NULL, 7, NULL);
+
+
     // Monitor mạng (ETH/WiFi) + quản lý state + stop mqtt khi mất internet
     xTaskCreate(net_monitor_task, "net_monitor_task", 4096, NULL, 7, NULL);
 
@@ -829,7 +925,7 @@ void app_main(void)
         .net_event_group = s_net_event_group,
         .online_bits = NET_WIFI_OK_BIT | NET_ETH_OK_BIT,
 
-        .poll_period_ms = 5000,
+        .poll_period_ms = 10000,
         .inter_request_ms = 100,
     };
 
