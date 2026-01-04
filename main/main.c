@@ -17,6 +17,7 @@
 #include "esp_http_server.h"
 #include <sys/param.h>
 #include "cJSON.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 #include "ethernet_manager.h"
 #include "modbus_pzem.h"
@@ -60,8 +61,54 @@ static EventGroupHandle_t s_net_event_group;
 #define NET_ETH_OK_BIT BIT1
 
 // variable modbus_rtu form stm32
-static const uint8_t stm32_slaves[] = {0x01,
-                                       /*0x02*/};
+static uint8_t *s_slave_ids = NULL;
+static size_t s_slave_count = 0;
+
+// check error wifi
+#define MQTT_CONNECTED_BIT (1 << 0)
+
+static EventGroupHandle_t s_mqtt_event_group;
+static volatile bool s_mqtt_auth_failed = false;
+static volatile uint32_t s_last_puback_ms = 0;
+
+static inline uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static esp_err_t build_slave_list_from_nvs(void)
+{
+    uint32_t n = gateway_config_number_device(); // ví dụ 3
+
+    // Giới hạn hợp lý (tuỳ bạn chỉnh)
+    if (n == 0)
+        n = 1;
+    if (n > 32)
+        n = 32;
+
+    // giải phóng nếu đã có
+    if (s_slave_ids)
+    {
+        free(s_slave_ids);
+        s_slave_ids = NULL;
+        s_slave_count = 0;
+    }
+
+    s_slave_ids = (uint8_t *)calloc(n, sizeof(uint8_t));
+    if (!s_slave_ids)
+        return ESP_ERR_NO_MEM;
+
+    for (uint32_t i = 0; i < n; i++)
+    {
+        s_slave_ids[i] = (uint8_t)(0x01 + i); // 0x01..0x01+n-1
+    }
+    s_slave_count = n;
+
+    ESP_LOGI(TAG, "Modbus slaves from NVS: count=%u, addr=0x%02X..0x%02X",
+             (unsigned)s_slave_count, s_slave_ids[0], s_slave_ids[s_slave_count - 1]);
+
+    return ESP_OK;
+}
 typedef struct
 {
     uint8_t port; // port01..portNN
@@ -91,10 +138,10 @@ static void mqtt_manager_start(void)
     gateway_set_state(GW_STATE_MQTT_CONNECTING);
 
     esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = "mqtt://72.61.140.234:1883",
-        .credentials.username = "thuanphat",
-        .credentials.authentication.password = "",
-        .credentials.client_id = "gw_cs_000002",
+        .broker.address.uri = gateway_config_mqtt_uri(),
+        .credentials.username = gateway_config_mqtt_user(),
+        .credentials.authentication.password = gateway_config_mqtt_pass(),
+        .credentials.client_id = gateway_config_mqtt_client_id(),
         .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
     };
 
@@ -135,8 +182,10 @@ static void net_monitor_task(void *arg)
         bool eth_ip = ethernet_manager_has_ip();
 
         // ✅ set/clear NET_ETH_OK_BIT để các task khác (MQTT publish) wake được
-        if (eth_ip) xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
-        else        xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+        if (eth_ip)
+            xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
+        else
+            xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
 
         bool wifi_ip = (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT);
 
@@ -144,7 +193,8 @@ static void net_monitor_task(void *arg)
         if (eth_ip && !last_eth_ip)
         {
             esp_netif_t *eth = ethernet_manager_get_netif();
-            if (eth) esp_netif_set_default_netif(eth);
+            if (eth)
+                esp_netif_set_default_netif(eth);
             gateway_set_state(GW_STATE_ETH_ONLINE);
         }
 
@@ -159,7 +209,6 @@ static void net_monitor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
-
 
 /* ---------------- HTTP server handlers ---------------- */
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -371,6 +420,8 @@ static void mqtt_event_handler(void *handler_args,
 
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI("MQTT", "Connected to ThingsBoard");
+        s_mqtt_auth_failed = false;
+        xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
         gateway_set_state(GW_STATE_MQTT_CONNECTED);
 
         char sub_cmd[128];
@@ -393,6 +444,7 @@ static void mqtt_event_handler(void *handler_args,
 
     case MQTT_EVENT_PUBLISHED:
         ESP_LOGI("MQTT", "Published OK, msg_id=%d", event->msg_id);
+        s_last_puback_ms = now_ms();
         break;
 
     case MQTT_EVENT_DATA:
@@ -600,11 +652,30 @@ static void mqtt_event_handler(void *handler_args,
     }
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW("MQTT", "Disconnected");
+        xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
         break;
 
     case MQTT_EVENT_ERROR:
+    {
         ESP_LOGE("MQTT", "Error");
+        xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+
+        int rc = -1;
+        if (event->error_handle)
+            rc = event->error_handle->connect_return_code;
+        ESP_LOGE("MQTT", "Error: connack_rc=%d", rc);
+
+        // rc==5: Not authorized
+        if (rc == 5)
+        {
+            s_mqtt_auth_failed = true;
+            ESP_LOGE("MQTT", "AUTH_FAIL (not authorized) -> stop publish");
+            // (khuyến nghị) stop client để khỏi reconnect spam
+            if (mqtt_client)
+                esp_mqtt_client_stop(mqtt_client);
+        }
         break;
+    }
 
     default:
         ESP_LOGW("MQTT", "Other event id:%d", event->event_id);
@@ -622,22 +693,26 @@ static void pzem_status_str(char *out, size_t out_sz,
                             uint8_t slave_id,
                             bool pzem_ok)
 {
-    if (!out || out_sz == 0) return;
+    if (!out || out_sz == 0)
+        return;
 
     // default
     strncpy(out, "unknown", out_sz - 1);
     out[out_sz - 1] = 0;
 
-    if (!p) return;
+    if (!p)
+        return;
 
     // 1) Không phản hồi slave
-    if (!pzem_ok) {
+    if (!pzem_ok)
+    {
         snprintf(out, out_sz, "No Response 0x%02X", slave_id);
         return;
     }
 
     // 2) CRC fail (nếu STM32 đánh dấu)
-    if (p->crc_fail) {
+    if (p->crc_fail)
+    {
         strncpy(out, "error", out_sz - 1);
         out[out_sz - 1] = 0;
         return;
@@ -645,21 +720,24 @@ static void pzem_status_str(char *out, size_t out_sz,
 
     // 3) Điện áp = 0 => Off
     // (dùng <= 0.01f để tránh nhiễu float)
-    if (p->voltage_v <= 0.01f) {
+    if (p->voltage_v <= 0.01f)
+    {
         strncpy(out, "Off", out_sz - 1);
         out[out_sz - 1] = 0;
         return;
     }
 
     // 4) Charging khi dòng > 0.02A
-    if (p->current_a > 0.02f) {
+    if (p->current_a > 0.02f)
+    {
         strncpy(out, "charging", out_sz - 1);
         out[out_sz - 1] = 0;
         return;
     }
 
     // 5) Idle khi V > 180V và I < 0.02A
-    if (p->voltage_v > 180.0f && p->current_a <= 0.02f) {
+    if (p->voltage_v > 180.0f && p->current_a <= 0.02f)
+    {
         strncpy(out, "Idle", out_sz - 1);
         out[out_sz - 1] = 0;
         return;
@@ -679,14 +757,29 @@ static void mqtt_publish_task(void *pvParameters)
                             NET_WIFI_OK_BIT | NET_ETH_OK_BIT,
                             pdFALSE, pdFALSE,
                             portMAX_DELAY);
+        // 2) nếu auth fail thì báo rõ và skip (đỡ hiểu nhầm “vẫn chạy”)
+        if (s_mqtt_auth_failed) {
+            ESP_LOGE("MQTT", "Skip publish: AUTH_FAIL (check username/password/ACL)");
+            // bạn có thể set state riêng: GW_STATE_MQTT_AUTH_FAIL
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
 
         // Có mạng -> đảm bảo MQTT chạy
         mqtt_manager_start();
 
         // Nếu MQTT chưa kịp tạo, chờ chút
-        if (!mqtt_client)
-        {
-            vTaskDelay(pdMS_TO_TICKS(500));
+        // if (!mqtt_client)
+        // {
+        //     vTaskDelay(pdMS_TO_TICKS(500));
+        //     continue;
+        // }
+        // 4) đợi MQTT connected thật sự
+        EventBits_t b = xEventGroupWaitBits(s_mqtt_event_group, MQTT_CONNECTED_BIT,
+                                        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+        if (!(b & MQTT_CONNECTED_BIT) || !mqtt_client) {
+            ESP_LOGW("MQTT", "Not connected -> skip this cycle");
+            vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
@@ -722,7 +815,6 @@ static void mqtt_publish_task(void *pvParameters)
                 bool ok = (k == 0) ? m.pzem1_ok : m.pzem2_ok;
                 pzem_status_str(status, sizeof(status), p, m.slave_id, ok);
 
-
                 char payload[256];
                 int len = snprintf(payload, sizeof(payload),
                                    "{"
@@ -747,7 +839,7 @@ static void mqtt_publish_task(void *pvParameters)
                 }
 
                 // Publish (giữ đúng style cũ)
-                status_led_pulse_green(1000);
+                status_led_pulse_green(500);
                 gateway_set_state(GW_STATE_SENDING_DATA);
 
                 int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
@@ -795,7 +887,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             xEventGroupClearBits(s_net_event_group, NET_WIFI_OK_BIT);
 
             bool eth_ok = ethernet_manager_has_ip() ||
-                        (xEventGroupGetBits(s_net_event_group) & NET_ETH_OK_BIT);
+                          (xEventGroupGetBits(s_net_event_group) & NET_ETH_OK_BIT);
 
             // ✅ Chỉ stop MQTT nếu mất cả WiFi và Ethernet
             if (!eth_ok)
@@ -1063,10 +1155,12 @@ void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(gateway_config_init());
+    ESP_ERROR_CHECK(build_slave_list_from_nvs());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     s_net_event_group = xEventGroupCreate();
+    s_mqtt_event_group = xEventGroupCreate();
     gateway_core_init();
     status_led_cfg_t cfg = {
         .red_gpio = LED_RED_GPIO,
@@ -1075,7 +1169,7 @@ void app_main(void)
         .active_high = false,
     };
     ESP_ERROR_CHECK(status_led_init(&cfg)); // ✅ tạo task LED trước
-    gateway_set_state(GW_STATE_ETH_CONNECTING); 
+    gateway_set_state(GW_STATE_ETH_CONNECTING);
     esp_err_t err = ethernet_manager_start(); // nên bỏ ESP_ERROR_CHECK để khỏi reboot
 
     xTaskCreate(wifi_reset_button_task, "wifi_reset_button_task", 4096, NULL, 5, NULL);
@@ -1095,11 +1189,11 @@ void app_main(void)
             .uart_num = 2,
             .tx_gpio = 10,
             .rx_gpio = 12,
-            .de_gpio = 11, // DE mapped to RTS
+            .de_gpio = 11,
             .baudrate = 9600,
         },
-        .slave_ids = stm32_slaves,
-        .slave_count = sizeof(stm32_slaves),
+        .slave_ids = s_slave_ids,
+        .slave_count = s_slave_count,
 
         .net_event_group = s_net_event_group,
         .online_bits = NET_WIFI_OK_BIT | NET_ETH_OK_BIT,
