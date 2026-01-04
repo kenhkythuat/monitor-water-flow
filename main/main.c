@@ -93,8 +93,8 @@ static void mqtt_manager_start(void)
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = "mqtt://72.61.140.234:1883",
         .credentials.username = "thuanphat",
-        .credentials.authentication.password = "123456789",
-        .credentials.client_id = "phat123",
+        .credentials.authentication.password = "",
+        .credentials.client_id = "gw_cs_000002",
         .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
     };
 
@@ -133,14 +133,18 @@ static void net_monitor_task(void *arg)
     while (1)
     {
         bool eth_ip = ethernet_manager_has_ip();
+
+        // ✅ set/clear NET_ETH_OK_BIT để các task khác (MQTT publish) wake được
+        if (eth_ip) xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
+        else        xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+
         bool wifi_ip = (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT);
 
         // ưu tiên ETH khi vừa có IP
         if (eth_ip && !last_eth_ip)
         {
             esp_netif_t *eth = ethernet_manager_get_netif();
-            if (eth)
-                esp_netif_set_default_netif(eth);
+            if (eth) esp_netif_set_default_netif(eth);
             gateway_set_state(GW_STATE_ETH_ONLINE);
         }
 
@@ -152,10 +156,10 @@ static void net_monitor_task(void *arg)
         }
 
         last_eth_ip = eth_ip;
-
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
+
 
 /* ---------------- HTTP server handlers ---------------- */
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -177,8 +181,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "</head>\n"
         "<body>\n"
         "  <div class='card'>\n"
-        "    <h3>ESP32 Wi-Fi Setup</h3>\n"
-        "    <p>Nhập SSID và mật khẩu mạng Wi-Fi bạn muốn ESP32 kết nối.</p>\n"
+        "    <h3>EV Bike Wi-Fi Setup</h3>\n"
+        "    <p>Nhập SSID và mật khẩu mạng Wi-Fi bạn muốn Gateway EV kết nối.</p>\n"
         "    <label>SSID</label>\n"
         "    <input id='ssid' placeholder='Your WiFi SSID'>\n"
         "    <label>Password</label>\n"
@@ -368,12 +372,6 @@ static void mqtt_event_handler(void *handler_args,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI("MQTT", "Connected to ThingsBoard");
         gateway_set_state(GW_STATE_MQTT_CONNECTED);
-
-        // Thêm subscribe cho topic command
-        // char topic_subcribe[128];
-        // snprintf(topic_subcribe, sizeof(topic_subcribe),
-        //          "tbmq/%s/#", gateway_config_device_id());
-        // esp_mqtt_client_subscribe(event->client, topic_subcribe, 0);
 
         char sub_cmd[128];
         snprintf(sub_cmd, sizeof(sub_cmd), "tbmq/%s/+/command", gateway_config_device_id());
@@ -618,21 +616,58 @@ static void mqtt_event_handler(void *handler_args,
 
 void status_led_pulse_green(uint32_t ms);
 
-// Status theo từng PZEM (riêng biệt)
-static const char *pzem_status_str(const pzem_data_t *p)
+// Status theo từng PZEM (riêng biệt) + slave_id + pzem_ok
+static void pzem_status_str(char *out, size_t out_sz,
+                            const pzem_data_t *p,
+                            uint8_t slave_id,
+                            bool pzem_ok)
 {
-    if (!p)
-        return "unknown";
+    if (!out || out_sz == 0) return;
 
-    // ưu tiên báo lỗi nếu STM32 đánh dấu crc_fail
-    if (p->crc_fail)
-        return "error";
+    // default
+    strncpy(out, "unknown", out_sz - 1);
+    out[out_sz - 1] = 0;
 
-    // đơn giản: có dòng thì charging
-    if (p->current_a > 0.02f)
-        return "charging";
+    if (!p) return;
 
-    return "idle";
+    // 1) Không phản hồi slave
+    if (!pzem_ok) {
+        snprintf(out, out_sz, "No Response 0x%02X", slave_id);
+        return;
+    }
+
+    // 2) CRC fail (nếu STM32 đánh dấu)
+    if (p->crc_fail) {
+        strncpy(out, "error", out_sz - 1);
+        out[out_sz - 1] = 0;
+        return;
+    }
+
+    // 3) Điện áp = 0 => Off
+    // (dùng <= 0.01f để tránh nhiễu float)
+    if (p->voltage_v <= 0.01f) {
+        strncpy(out, "Off", out_sz - 1);
+        out[out_sz - 1] = 0;
+        return;
+    }
+
+    // 4) Charging khi dòng > 0.02A
+    if (p->current_a > 0.02f) {
+        strncpy(out, "charging", out_sz - 1);
+        out[out_sz - 1] = 0;
+        return;
+    }
+
+    // 5) Idle khi V > 180V và I < 0.02A
+    if (p->voltage_v > 180.0f && p->current_a <= 0.02f) {
+        strncpy(out, "Idle", out_sz - 1);
+        out[out_sz - 1] = 0;
+        return;
+    }
+
+    // fallback
+    strncpy(out, "Idle", out_sz - 1);
+    out[out_sz - 1] = 0;
 }
 
 static void mqtt_publish_task(void *pvParameters)
@@ -683,7 +718,10 @@ static void mqtt_publish_task(void *pvParameters)
                 // energy: Wh -> kWh để giống kiểu 1.24
                 float energy_kwh = p->energy_wh;
 
-                const char *status = pzem_status_str(p);
+                char status[32];
+                bool ok = (k == 0) ? m.pzem1_ok : m.pzem2_ok;
+                pzem_status_str(status, sizeof(status), p, m.slave_id, ok);
+
 
                 char payload[256];
                 int len = snprintf(payload, sizeof(payload),
@@ -752,18 +790,32 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             break;
 
         case WIFI_EVENT_STA_DISCONNECTED:
+        {
             ESP_LOGW(TAG, "Wi-Fi disconnected");
             xEventGroupClearBits(s_net_event_group, NET_WIFI_OK_BIT);
-            if (mqtt_client)
+
+            bool eth_ok = ethernet_manager_has_ip() ||
+                        (xEventGroupGetBits(s_net_event_group) & NET_ETH_OK_BIT);
+
+            // ✅ Chỉ stop MQTT nếu mất cả WiFi và Ethernet
+            if (!eth_ok)
             {
-                esp_mqtt_client_stop(mqtt_client);
-                esp_mqtt_client_destroy(mqtt_client);
-                mqtt_client = NULL;
-                mqtt_task_started = false;
-                ESP_LOGI(TAG, "MQTT client stopped due to Wi-Fi lost");
+                if (mqtt_client)
+                {
+                    esp_mqtt_client_stop(mqtt_client);
+                    esp_mqtt_client_destroy(mqtt_client);
+                    mqtt_client = NULL;
+                    mqtt_task_started = false;
+                    ESP_LOGI(TAG, "MQTT client stopped due to internet lost");
+                }
+            }
+            else
+            {
+                ESP_LOGI(TAG, "ETH online -> keep MQTT, WiFi will retry in background");
             }
 
-            if (s_retry_num < 100)
+            // ✅ WiFi vẫn retry, nhưng KHÔNG restart nếu Ethernet đang online
+            if (s_retry_num < 20)
             {
                 esp_wifi_connect();
                 s_retry_num++;
@@ -771,11 +823,23 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             }
             else
             {
-                // Không vào AP nữa. RESET chip để tự kết nối lại
-                ESP_LOGE(TAG, "Wi-Fi cannot connect after retries → restarting...");
-                esp_restart();
+                if (!eth_ok)
+                {
+                    ESP_LOGE(TAG, "Wi-Fi cannot connect after retries AND no ETH -> restarting...");
+                    esp_restart();
+                }
+                else
+                {
+                    // có ETH thì chỉ backoff rồi thử lại, không restart
+                    ESP_LOGW(TAG, "Wi-Fi retries exceeded but ETH OK -> backoff 10s then retry");
+                    vTaskDelay(pdMS_TO_TICKS(10000));
+                    s_retry_num = 0;
+                    esp_wifi_connect();
+                }
             }
             break;
+        }
+
         default:
             break;
         }
@@ -1011,7 +1075,7 @@ void app_main(void)
         .active_high = false,
     };
     ESP_ERROR_CHECK(status_led_init(&cfg)); // ✅ tạo task LED trước
-    gateway_set_state(GW_STATE_ETH_CONNECTING);
+    gateway_set_state(GW_STATE_ETH_CONNECTING); 
     esp_err_t err = ethernet_manager_start(); // nên bỏ ESP_ERROR_CHECK để khỏi reboot
 
     xTaskCreate(wifi_reset_button_task, "wifi_reset_button_task", 4096, NULL, 5, NULL);

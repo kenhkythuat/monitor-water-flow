@@ -94,8 +94,7 @@ static esp_err_t modbus_read_input_regs(uint8_t slave_id, uint16_t start, uint16
     uart_flush_input(uartn);
 
     // ===== DEBUG TX =====
-    ESP_LOGI(TAG, "MB TX slave=0x%02X fc=0x%02X start=0x%04X qty=%u",
-             slave_id, req[1], start, qty);
+    //ESP_LOGI(TAG, "MB TX slave=0x%02X fc=0x%02X start=0x%04X qty=%u",slave_id, req[1], start, qty);
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, req, sizeof(req), ESP_LOG_INFO);
 
     int w = uart_write_bytes(uartn, (const char*)req, sizeof(req));
@@ -107,14 +106,14 @@ static esp_err_t modbus_read_input_regs(uint8_t slave_id, uint16_t start, uint16
     uint8_t hdr[3] = {0};
     int r = uart_read_bytes(uartn, hdr, 3, pdMS_TO_TICKS(timeout_ms));
     if (r != 3) {
-        ESP_LOGW(TAG, "MB RX timeout hdr: got=%d/3 slave=0x%02X start=0x%04X", r, slave_id, start);
+        //ESP_LOGW(TAG, "MB RX timeout hdr: got=%d/3 slave=0x%02X start=0x%04X", r, slave_id, start);
         if (r > 0) ESP_LOG_BUFFER_HEX_LEVEL(TAG, hdr, r, ESP_LOG_WARN);
         return ESP_ERR_TIMEOUT;
     }
 
     // ===== DEBUG RX HDR =====
-    ESP_LOGI(TAG, "MB RX hdr:");
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, hdr, 3, ESP_LOG_INFO);
+    //ESP_LOGI(TAG, "MB RX hdr:");
+    //ESP_LOG_BUFFER_HEX_LEVEL(TAG, hdr, 3, ESP_LOG_INFO);
 
     if (hdr[0] != slave_id) return ESP_FAIL;
 
@@ -149,8 +148,8 @@ static esp_err_t modbus_read_input_regs(uint8_t slave_id, uint16_t start, uint16
     uint8_t frame[300];
     memcpy(frame, hdr, 3);
     memcpy(frame + 3, buf, byte_count + 2);
-    ESP_LOGI(TAG, "MB RX frame:");
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame, 3 + byte_count + 2, ESP_LOG_INFO);
+    //ESP_LOGI(TAG, "MB RX frame:");
+    //ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame, 3 + byte_count + 2, ESP_LOG_INFO);
 
     // CRC check
     uint16_t crc_calc = modbus_crc16(frame, 3 + byte_count);
@@ -268,6 +267,9 @@ static void poll_one_slave(uint8_t slave_id)
     }
 
     stm32_meter_t *m = &s_meters[idx];
+    
+    m->pzem1_ok = (e1 == ESP_OK);
+    m->pzem2_ok = (e2 == ESP_OK);
 
     if (e1 == ESP_OK && e2 == ESP_OK) {
         parse_pzem_regs(regs1, &m->pzem1);
@@ -378,7 +380,7 @@ static esp_err_t modbus_write_single_reg_internal(uint8_t slave_id, uint16_t reg
 
     uart_flush_input(uartn);
 
-    ESP_LOGI(TAG, "MB TX FC06 slave=0x%02X reg=0x%04X val=0x%04X", slave_id, reg, value);
+    //ESP_LOGI(TAG, "MB TX FC06 slave=0x%02X reg=0x%04X val=0x%04X", slave_id, reg, value);
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, req, sizeof(req), ESP_LOG_INFO);
 
     int w = uart_write_bytes(uartn, (const char*)req, sizeof(req));
@@ -389,7 +391,7 @@ static esp_err_t modbus_write_single_reg_internal(uint8_t slave_id, uint16_t reg
     uint8_t rsp[8] = {0};
     int r = uart_read_bytes(uartn, rsp, 8, pdMS_TO_TICKS(timeout_ms));
     if (r != 8) {
-        ESP_LOGW(TAG, "MB RX timeout FC06 echo: got=%d/8", r);
+        //ESP_LOGW(TAG, "MB RX timeout FC06 echo: got=%d/8", r);
         if (r > 0) ESP_LOG_BUFFER_HEX_LEVEL(TAG, rsp, r, ESP_LOG_WARN);
         return ESP_ERR_TIMEOUT;
     }

@@ -26,6 +26,8 @@ typedef struct {
     uint8_t  slave_id;   // STM32 modbus addr (0x01, 0x02...)
     pzem_data_t pzem1;   // base 0x0000..0x0009
     pzem_data_t pzem2;   // base 0x0010..0x0019
+    bool pzem1_ok;   // ✅ lần đọc gần nhất PZEM1 OK?
+    bool pzem2_ok;   // ✅ lần đọc gần nhất PZEM2 OK?
     uint32_t last_ok_ms;
     uint32_t last_err_ms;
     uint32_t ok_count;
