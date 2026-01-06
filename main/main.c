@@ -22,6 +22,8 @@
 #include "ethernet_manager.h"
 #include "modbus_pzem.h"
 #include "gateway_config.h"
+#include "gw_time.h"
+
 
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
@@ -176,25 +178,28 @@ static void mqtt_manager_stop(void)
 static void net_monitor_task(void *arg)
 {
     bool last_eth_ip = false;
+    bool last_any_online = false;
 
     while (1)
     {
         bool eth_ip = ethernet_manager_has_ip();
 
-        // ✅ set/clear NET_ETH_OK_BIT để các task khác (MQTT publish) wake được
-        if (eth_ip)
-            xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
-        else
-            xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+        if (eth_ip) xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
+        else        xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
 
         bool wifi_ip = (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT);
+        bool any_online = eth_ip || wifi_ip;
+
+        // ✅ Vừa có mạng lần đầu (ETH hoặc WiFi) -> start SNTP 1 lần
+        if (any_online && !last_any_online) {
+            gw_time_init();   // an toàn gọi nhiều lần, nhưng ở đây chỉ gọi khi transition offline->online
+        }
 
         // ưu tiên ETH khi vừa có IP
         if (eth_ip && !last_eth_ip)
         {
             esp_netif_t *eth = ethernet_manager_get_netif();
-            if (eth)
-                esp_netif_set_default_netif(eth);
+            if (eth) esp_netif_set_default_netif(eth);
             gateway_set_state(GW_STATE_ETH_ONLINE);
         }
 
@@ -206,9 +211,12 @@ static void net_monitor_task(void *arg)
         }
 
         last_eth_ip = eth_ip;
+        last_any_online = any_online;
+
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
+
 
 /* ---------------- HTTP server handlers ---------------- */
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -722,7 +730,7 @@ static void pzem_status_str(char *out, size_t out_sz,
     // (dùng <= 0.01f để tránh nhiễu float)
     if (p->voltage_v <= 0.01f)
     {
-        strncpy(out, "Off", out_sz - 1);
+        strncpy(out, "available", out_sz - 1);
         out[out_sz - 1] = 0;
         return;
     }
@@ -738,7 +746,7 @@ static void pzem_status_str(char *out, size_t out_sz,
     // 5) Idle khi V > 180V và I < 0.02A
     if (p->voltage_v > 180.0f && p->current_a <= 0.02f)
     {
-        strncpy(out, "Idle", out_sz - 1);
+        strncpy(out, "charging", out_sz - 1);
         out[out_sz - 1] = 0;
         return;
     }
@@ -807,17 +815,17 @@ static void mqtt_publish_task(void *pvParameters)
                 char topic[128];
                 snprintf(topic, sizeof(topic),
                          "tbmq/%s/port%02u/telemetry", gateway_config_device_id(), (unsigned)port_num);
-
-                // energy: Wh -> kWh để giống kiểu 1.24
                 float energy_kwh = p->energy_wh;
 
                 char status[32];
                 bool ok = (k == 0) ? m.pzem1_ok : m.pzem2_ok;
                 pzem_status_str(status, sizeof(status), p, m.slave_id, ok);
-
+                //get timestamp
+                uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
                 char payload[256];
                 int len = snprintf(payload, sizeof(payload),
                                    "{"
+                                   "\"ts\":%u,"
                                    "\"data\":{"
                                    "\"voltage\":%.1f,"
                                    "\"current\":%.3f,"
@@ -826,6 +834,7 @@ static void mqtt_publish_task(void *pvParameters)
                                    "\"status\":\"%s\""
                                    "}"
                                    "}",
+                                   (unsigned)ts,
                                    p->voltage_v,
                                    p->current_a,
                                    p->power_w,
@@ -838,15 +847,14 @@ static void mqtt_publish_task(void *pvParameters)
                     continue;
                 }
 
-                // Publish (giữ đúng style cũ)
-                status_led_pulse_green(500);
-                gateway_set_state(GW_STATE_SENDING_DATA);
-
                 int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
 
                 if (msg_id >= 0)
                 {
                     ESP_LOGI("MQTT", "Published msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+                    // Publish (giữ đúng style cũ)
+                    status_led_pulse_green(500);
+                    gateway_set_state(GW_STATE_SENDING_DATA);
                 }
                 else
                 {
