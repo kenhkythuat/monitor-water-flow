@@ -708,7 +708,9 @@ static void mqtt_event_handler(void *handler_args,
             // cmd -> value FC06
             uint16_t value = 0x0000;
             if (strcmp(cmd, "start_charge") == 0)
+            {
                 value = 0x0003; // relay ON + led ON
+            }
             else if (strcmp(cmd, "stop_charge") == 0)
                 value = 0x0000; // OFF
             else
@@ -1214,14 +1216,43 @@ static void mqtt_cmd_task(void *arg)
         if (e == ESP_OK)
         {
             ESP_LOGI("CMD", "OK cmd=%s port%02u", c.cmd, c.port);
+
+            // ✅ QUẢN LÝ TIMEOUT SAU KHI MODBUS OK
+            if (strcmp(c.cmd, "start_charge") == 0)
+            {
+                uint32_t to = (c.timeout_s > 0) ? (uint32_t)c.timeout_s : 0;
+                esp_err_t te = modbus_pzem_port_arm_timeout(c.port, to);
+                if (te != ESP_OK) {
+                    ESP_LOGW("CMD", "arm_timeout fail port%02u err=%s", c.port, esp_err_to_name(te));
+                } else {
+                    uint32_t remain;
+                    if (modbus_pzem_port_get_remaining(c.port, &remain)) {
+                        if (remain == 0xFFFFFFFFu)
+                            ESP_LOGI("CMD", "port%02u ON (no timeout)", c.port);
+                        else
+                            ESP_LOGI("CMD", "port%02u timeout remaining=%us", c.port, (unsigned)remain);
+                    }
+                }
+            }
+            else if (strcmp(c.cmd, "stop_charge") == 0)
+            {
+                esp_err_t te = modbus_pzem_port_clear_state(c.port);
+                if (te != ESP_OK) {
+                    ESP_LOGW("CMD", "clear_state fail port%02u err=%s", c.port, esp_err_to_name(te));
+                } else {
+                    ESP_LOGI("CMD", "port%02u OFF (timeout cleared)", c.port);
+                }
+            }
         }
         else
         {
             ESP_LOGW("CMD", "FAIL cmd=%s port%02u err=%s", c.cmd, c.port, esp_err_to_name(e));
+
+            // ❗ Nếu bật thất bại thì không arm timeout.
+            // (tuỳ bạn) nếu stop_charge thất bại thì không clear state.
         }
 
-        // (tuỳ bạn) publish ack lại server:
-        // tbmq/cs_000001/portXX/ack  {"cmd":"...","result":"ok/fail"}
+        // publish ack lại server
         if (mqtt_client)
         {
             char topic[96];
@@ -1233,6 +1264,7 @@ static void mqtt_cmd_task(void *arg)
         }
     }
 }
+
 
 static esp_err_t mqtt_publish_status_gateway(void)
 {

@@ -71,6 +71,26 @@ esp_err_t modbus_pzem_write_single_reg(uint8_t slave_id, uint16_t reg, uint16_t 
 // map portXX -> slave_id + reg(0x0100/0x0101) theo danh sách stm32_slaves
 bool modbus_pzem_map_port_to_slave_reg(uint8_t port_num, uint8_t *out_slave, uint16_t *out_reg);
 
+// ===== Port control with timeout =====
+
+// Bật/tắt tải theo port (FC06 ghi 1/0 vào reg 0x0100/0x0101 tương ứng)
+esp_err_t modbus_pzem_port_set(uint8_t port_num, bool on);
+
+// Bật tải + set timeout (giây). timeout_s=0 => bật nhưng không auto tắt
+esp_err_t modbus_pzem_port_start_timeout(uint8_t port_num, uint32_t timeout_s);
+
+// Lấy thời gian còn lại (giây). return false nếu port invalid hoặc đang OFF.
+// remain_s = 0 nghĩa là đã hết hạn (sắp bị task tắt / vừa tắt).
+bool modbus_pzem_port_get_remaining(uint8_t port_num, uint32_t *remain_s);
+
+// Sau khi bạn đã bật port bằng FC06 thành công, gọi hàm này để bắt đầu timeout
+esp_err_t modbus_pzem_port_arm_timeout(uint8_t port_num, uint32_t timeout_s);
+
+// Khi tắt port thành công, gọi hàm này để clear state
+esp_err_t modbus_pzem_port_clear_state(uint8_t port_num);
+
+
+
 
 #ifdef __cplusplus
 }

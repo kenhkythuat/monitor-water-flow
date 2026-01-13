@@ -44,6 +44,23 @@ static uint8_t s_meter_count = 0;
 
 static SemaphoreHandle_t s_lock;
 
+// ===================== PORT TIMEOUT STATE =====================
+#define MAX_PORTS   (MAX_SLAVES * 2)
+
+typedef struct {
+    bool     on;
+    uint32_t deadline_ms;   // thời điểm hết hạn (now_ms) ; 0 nếu không timeout
+} port_state_t;
+
+static port_state_t s_ports[MAX_PORTS];
+static SemaphoreHandle_t s_port_lock;
+static TaskHandle_t s_port_timeout_task_handle = NULL;
+
+static inline uint8_t total_ports(void)
+{
+    return (uint8_t)(s_cfg.slave_count * 2);
+}
+
 // ===================== UART RS485 INIT =====================
 static esp_err_t rs485_uart_init(const rs485_modbus_cfg_t *c)
 {
@@ -229,28 +246,83 @@ static void dump_pzem_regs(const char *tag, uint8_t slave_id, const char *name,
 
 
 // ===================== POLL ONE SLAVE =====================
+// static void poll_one_slave(uint8_t slave_id)
+// {
+//     uint16_t regs1[10] = {0};
+//     uint16_t regs2[10] = {0};
+
+//     esp_err_t e1 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
+//     vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
+//     esp_err_t e2 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
+
+//         // ✅ DEBUG DUMP NGAY SAU KHI ĐỌC
+//     if (e1 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM1", 0x0000, regs1);
+//     else ESP_LOGW(TAG, "slave=0x%02X PZEM1 read err: %s", slave_id, esp_err_to_name(e1));
+
+//     if (e2 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM2", 0x0010, regs2);
+//     else ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
+
+//     xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
+//     esp_err_t e3 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
+//     vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
+//     esp_err_t e4 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
+//     xSemaphoreGive(s_uart_mutex);
+
+
+//     xSemaphoreTake(s_lock, portMAX_DELAY);
+
+//     // find meter slot
+//     int idx = -1;
+//     for (int i = 0; i < s_meter_count; i++) {
+//         if (s_meters[i].slave_id == slave_id) { idx = i; break; }
+//     }
+
+//     if (idx < 0) {
+//         // should not happen, but safe
+//         xSemaphoreGive(s_lock);
+//         return;
+//     }
+
+//     stm32_meter_t *m = &s_meters[idx];
+    
+//     m->pzem1_ok = (e1 == ESP_OK);
+//     m->pzem2_ok = (e2 == ESP_OK);
+
+//     if (e1 == ESP_OK && e2 == ESP_OK) {
+//         parse_pzem_regs(regs1, &m->pzem1);
+//         parse_pzem_regs(regs2, &m->pzem2);
+//         m->last_ok_ms = now_ms();
+//         m->ok_count++;
+//     } else {
+//         m->last_err_ms = now_ms();
+//         m->err_count++;
+//         if (e1 != ESP_OK) ESP_LOGW(TAG, "slave=0x%02X PZEM1 read err: %s", slave_id, esp_err_to_name(e1));
+//         if (e2 != ESP_OK) ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
+//     }
+
+//     xSemaphoreGive(s_lock);
+// }
+
 static void poll_one_slave(uint8_t slave_id)
 {
     uint16_t regs1[10] = {0};
     uint16_t regs2[10] = {0};
 
-    esp_err_t e1 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
-    vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
-    esp_err_t e2 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
+    esp_err_t e1, e2;
 
-        // ✅ DEBUG DUMP NGAY SAU KHI ĐỌC
+    // ✅ BẮT BUỘC: bảo vệ UART vì có task timeout cũng dùng UART
+    xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
+    e1 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
+    vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
+    e2 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
+    xSemaphoreGive(s_uart_mutex);
+
+    // ✅ DEBUG DUMP NGAY SAU KHI ĐỌC
     if (e1 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM1", 0x0000, regs1);
     else ESP_LOGW(TAG, "slave=0x%02X PZEM1 read err: %s", slave_id, esp_err_to_name(e1));
 
     if (e2 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM2", 0x0010, regs2);
     else ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
-
-    xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
-    esp_err_t e3 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
-    vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
-    esp_err_t e4 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
-    xSemaphoreGive(s_uart_mutex);
-
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
@@ -259,15 +331,10 @@ static void poll_one_slave(uint8_t slave_id)
     for (int i = 0; i < s_meter_count; i++) {
         if (s_meters[i].slave_id == slave_id) { idx = i; break; }
     }
-
-    if (idx < 0) {
-        // should not happen, but safe
-        xSemaphoreGive(s_lock);
-        return;
-    }
+    if (idx < 0) { xSemaphoreGive(s_lock); return; }
 
     stm32_meter_t *m = &s_meters[idx];
-    
+
     m->pzem1_ok = (e1 == ESP_OK);
     m->pzem2_ok = (e2 == ESP_OK);
 
@@ -279,12 +346,11 @@ static void poll_one_slave(uint8_t slave_id)
     } else {
         m->last_err_ms = now_ms();
         m->err_count++;
-        if (e1 != ESP_OK) ESP_LOGW(TAG, "slave=0x%02X PZEM1 read err: %s", slave_id, esp_err_to_name(e1));
-        if (e2 != ESP_OK) ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
     }
 
     xSemaphoreGive(s_lock);
 }
+
 
 // ===================== TASK =====================
 static void modbus_pzem_task(void *arg)
@@ -311,6 +377,42 @@ static void modbus_pzem_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(s_cfg.poll_period_ms));
     }
 }
+static void port_timeout_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // ✅ CHẮN NULL để không assert
+        if (!s_inited || !s_port_lock) {
+            continue;
+        }
+
+        uint32_t now = now_ms();
+        uint8_t nports = (uint8_t)(s_cfg.slave_count * 2);
+
+        for (uint8_t port = 1; port <= nports; port++) {
+            bool need_off = false;
+
+            xSemaphoreTake(s_port_lock, portMAX_DELAY);
+            port_state_t st = s_ports[port - 1];
+            if (st.on && st.deadline_ms != 0 && (int32_t)(now - st.deadline_ms) >= 0) {
+                need_off = true;
+                s_ports[port - 1].on = false;
+                s_ports[port - 1].deadline_ms = 0;
+            }
+            xSemaphoreGive(s_port_lock);
+
+            if (need_off) {
+                uint8_t slave; uint16_t reg;
+                if (modbus_pzem_map_port_to_slave_reg(port, &slave, &reg)) {
+                    modbus_pzem_write_single_reg(slave, reg, 0);
+                }
+            }
+        }
+    }
+}
 
 // ===================== PUBLIC API =====================
 esp_err_t modbus_pzem_init(const modbus_pzem_cfg_t *cfg)
@@ -323,6 +425,11 @@ esp_err_t modbus_pzem_init(const modbus_pzem_cfg_t *cfg)
 
     if (!s_lock) s_lock = xSemaphoreCreateMutex();
     if (!s_lock) return ESP_ERR_NO_MEM;
+
+    if (!s_port_lock) s_port_lock = xSemaphoreCreateMutex();
+    if (!s_port_lock) return ESP_ERR_NO_MEM;
+    memset(s_ports, 0, sizeof(s_ports));
+
     if (!s_uart_mutex) s_uart_mutex = xSemaphoreCreateMutex();
     if (!s_uart_mutex) return ESP_ERR_NO_MEM;
 
@@ -345,14 +452,102 @@ esp_err_t modbus_pzem_init(const modbus_pzem_cfg_t *cfg)
 esp_err_t modbus_pzem_start(void)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
-    BaseType_t ok = xTaskCreate(modbus_pzem_task, "modbus_pzem_task", 4096, NULL, 6, NULL);
-    return (ok == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
+if (!s_lock || !s_uart_mutex || !s_port_lock) {
+    ESP_LOGE(TAG, "start invalid state: s_lock=%p s_uart_mutex=%p s_port_lock=%p",
+             s_lock, s_uart_mutex, s_port_lock);
+    return ESP_ERR_INVALID_STATE;
 }
+
+    BaseType_t ok1 = xTaskCreate(modbus_pzem_task, "modbus_pzem_task", 4096, NULL, 6, NULL);
+    if (ok1 != pdPASS) return ESP_ERR_NO_MEM;
+
+    BaseType_t ok2 = xTaskCreate(port_timeout_task, "port_timeout_task", 3072, NULL, 5, NULL);
+    if (ok2 != pdPASS) return ESP_ERR_NO_MEM;
+
+    return ESP_OK;
+}
+
+
 
 uint8_t modbus_pzem_get_meter_count(void)
 {
     return s_meter_count;
 }
+esp_err_t modbus_pzem_port_set(uint8_t port_num, bool on)
+{
+    uint8_t slave;
+    uint16_t reg;
+
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    if (!modbus_pzem_map_port_to_slave_reg(port_num, &slave, &reg)) return ESP_ERR_INVALID_ARG;
+
+    esp_err_t e = modbus_pzem_write_single_reg(slave, reg, on ? 1 : 0);
+    if (e != ESP_OK) return e;
+
+    xSemaphoreTake(s_port_lock, portMAX_DELAY);
+    s_ports[port_num - 1].on = on;
+    s_ports[port_num - 1].deadline_ms = 0; // set() trực tiếp thì bỏ timeout
+    xSemaphoreGive(s_port_lock);
+
+    return ESP_OK;
+}
+
+esp_err_t modbus_pzem_port_start_timeout(uint8_t port_num, uint32_t timeout_s)
+{
+    uint8_t slave;
+    uint16_t reg;
+
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    if (!modbus_pzem_map_port_to_slave_reg(port_num, &slave, &reg)) return ESP_ERR_INVALID_ARG;
+
+    // 1) bật tải
+    esp_err_t e = modbus_pzem_write_single_reg(slave, reg, 1);
+    if (e != ESP_OK) return e;
+
+    // 2) set deadline
+    uint32_t deadline = 0;
+    if (timeout_s > 0) {
+        // chống overflow đơn giản
+        uint64_t d = (uint64_t)now_ms() + (uint64_t)timeout_s * 1000ULL;
+        deadline = (d > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)d;
+    }
+
+    xSemaphoreTake(s_port_lock, portMAX_DELAY);
+    s_ports[port_num - 1].on = true;
+    s_ports[port_num - 1].deadline_ms = deadline;
+    xSemaphoreGive(s_port_lock);
+
+    return ESP_OK;
+}
+
+bool modbus_pzem_port_get_remaining(uint8_t port_num, uint32_t *remain_s)
+{
+    if (!s_inited || !remain_s) return false;
+    if (port_num == 0 || port_num > total_ports()) return false;
+
+    uint32_t now = now_ms();
+
+    xSemaphoreTake(s_port_lock, portMAX_DELAY);
+    port_state_t st = s_ports[port_num - 1];
+    xSemaphoreGive(s_port_lock);
+
+    if (!st.on) return false;
+
+    if (st.deadline_ms == 0) {
+        // không timeout
+        *remain_s = 0xFFFFFFFFu;
+        return true;
+    }
+
+    if ((int32_t)(now - st.deadline_ms) >= 0) {
+        *remain_s = 0;
+        return true;
+    }
+
+    *remain_s = (st.deadline_ms - now) / 1000u;
+    return true;
+}
+
 
 bool modbus_pzem_get_meter(uint8_t index, stm32_meter_t *out)
 {
@@ -432,4 +627,37 @@ bool modbus_pzem_map_port_to_slave_reg(uint8_t port_num, uint8_t *out_slave, uin
     *out_reg   = (which == 0) ? 0x0100 : 0x0101;
     return true;
 }
+
+esp_err_t modbus_pzem_port_arm_timeout(uint8_t port_num, uint32_t timeout_s)
+{
+    if (!s_inited || !s_port_lock) return ESP_ERR_INVALID_STATE;
+    if (port_num == 0 || port_num > (uint8_t)(s_cfg.slave_count * 2)) return ESP_ERR_INVALID_ARG;
+
+    uint32_t deadline = 0;
+    if (timeout_s > 0) {
+        uint64_t d = (uint64_t)now_ms() + (uint64_t)timeout_s * 1000ULL;
+        deadline = (d > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)d;
+    }
+
+    xSemaphoreTake(s_port_lock, portMAX_DELAY);
+    s_ports[port_num - 1].on = true;
+    s_ports[port_num - 1].deadline_ms = deadline;   // 0 => không auto-off
+    xSemaphoreGive(s_port_lock);
+
+    return ESP_OK;
+}
+
+esp_err_t modbus_pzem_port_clear_state(uint8_t port_num)
+{
+    if (!s_inited || !s_port_lock) return ESP_ERR_INVALID_STATE;
+    if (port_num == 0 || port_num > (uint8_t)(s_cfg.slave_count * 2)) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_port_lock, portMAX_DELAY);
+    s_ports[port_num - 1].on = false;
+    s_ports[port_num - 1].deadline_ms = 0;
+    xSemaphoreGive(s_port_lock);
+
+    return ESP_OK;
+}
+
 
