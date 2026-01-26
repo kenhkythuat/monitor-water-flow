@@ -246,63 +246,6 @@ static void dump_pzem_regs(const char *tag, uint8_t slave_id, const char *name,
 
 
 // ===================== POLL ONE SLAVE =====================
-// static void poll_one_slave(uint8_t slave_id)
-// {
-//     uint16_t regs1[10] = {0};
-//     uint16_t regs2[10] = {0};
-
-//     esp_err_t e1 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
-//     vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
-//     esp_err_t e2 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
-
-//         // ✅ DEBUG DUMP NGAY SAU KHI ĐỌC
-//     if (e1 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM1", 0x0000, regs1);
-//     else ESP_LOGW(TAG, "slave=0x%02X PZEM1 read err: %s", slave_id, esp_err_to_name(e1));
-
-//     if (e2 == ESP_OK) dump_pzem_regs(TAG, slave_id, "PZEM2", 0x0010, regs2);
-//     else ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
-
-//     xSemaphoreTake(s_uart_mutex, portMAX_DELAY);
-//     esp_err_t e3 = modbus_read_input_regs(slave_id, 0x0000, 0x000A, regs1, 500);
-//     vTaskDelay(pdMS_TO_TICKS(s_cfg.inter_request_ms));
-//     esp_err_t e4 = modbus_read_input_regs(slave_id, 0x0010, 0x000A, regs2, 500);
-//     xSemaphoreGive(s_uart_mutex);
-
-
-//     xSemaphoreTake(s_lock, portMAX_DELAY);
-
-//     // find meter slot
-//     int idx = -1;
-//     for (int i = 0; i < s_meter_count; i++) {
-//         if (s_meters[i].slave_id == slave_id) { idx = i; break; }
-//     }
-
-//     if (idx < 0) {
-//         // should not happen, but safe
-//         xSemaphoreGive(s_lock);
-//         return;
-//     }
-
-//     stm32_meter_t *m = &s_meters[idx];
-    
-//     m->pzem1_ok = (e1 == ESP_OK);
-//     m->pzem2_ok = (e2 == ESP_OK);
-
-//     if (e1 == ESP_OK && e2 == ESP_OK) {
-//         parse_pzem_regs(regs1, &m->pzem1);
-//         parse_pzem_regs(regs2, &m->pzem2);
-//         m->last_ok_ms = now_ms();
-//         m->ok_count++;
-//     } else {
-//         m->last_err_ms = now_ms();
-//         m->err_count++;
-//         if (e1 != ESP_OK) ESP_LOGW(TAG, "slave=0x%02X PZEM1 read err: %s", slave_id, esp_err_to_name(e1));
-//         if (e2 != ESP_OK) ESP_LOGW(TAG, "slave=0x%02X PZEM2 read err: %s", slave_id, esp_err_to_name(e2));
-//     }
-
-//     xSemaphoreGive(s_lock);
-// }
-
 static void poll_one_slave(uint8_t slave_id)
 {
     uint16_t regs1[10] = {0};

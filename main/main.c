@@ -26,7 +26,6 @@
 #include "gw_time.h"
 #include "gw_temp.h"
 
-
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
 #define WIFI_CONNECTED_BIT BIT0
@@ -170,22 +169,26 @@ static void delayed_restart_task(void *arg)
 // }
 void mqtt_manager_init(void)
 {
-    if (!s_mqtt_start_lock) {
+    if (!s_mqtt_start_lock)
+    {
         s_mqtt_start_lock = xSemaphoreCreateMutex();
     }
 }
 
 void mqtt_manager_start(void)
 {
-    if (!s_mqtt_start_lock) mqtt_manager_init();
+    if (!s_mqtt_start_lock)
+        mqtt_manager_init();
 
     // Fast path (không lock) – OK nhưng vẫn cần lock để tránh race
-    if (mqtt_client) return;
+    if (mqtt_client)
+        return;
 
     xSemaphoreTake(s_mqtt_start_lock, portMAX_DELAY);
 
     // Double-check sau khi đã lock
-    if (mqtt_client || s_mqtt_starting) {
+    if (mqtt_client || s_mqtt_starting)
+    {
         xSemaphoreGive(s_mqtt_start_lock);
         return;
     }
@@ -204,7 +207,8 @@ void mqtt_manager_start(void)
     };
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    if (!client) {
+    if (!client)
+    {
         ESP_LOGE("MQTT", "Failed to init client");
         xSemaphoreTake(s_mqtt_start_lock, portMAX_DELAY);
         s_mqtt_starting = false;
@@ -215,7 +219,8 @@ void mqtt_manager_start(void)
     esp_mqtt_client_register_event(client, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
 
     esp_err_t err = esp_mqtt_client_start(client);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         ESP_LOGE("MQTT", "Failed to start: %s", esp_err_to_name(err));
         esp_mqtt_client_destroy(client);
 
@@ -251,8 +256,10 @@ static void net_monitor_task(void *arg)
     {
         bool eth_ip = ethernet_manager_has_ip();
 
-        if (eth_ip) xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
-        else        xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
+        if (eth_ip)
+            xEventGroupSetBits(s_net_event_group, NET_ETH_OK_BIT);
+        else
+            xEventGroupClearBits(s_net_event_group, NET_ETH_OK_BIT);
 
         bool wifi_ip = (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT);
         bool any_online = eth_ip || wifi_ip;
@@ -285,7 +292,8 @@ static void net_monitor_task(void *arg)
         if (eth_ip && !last_eth_ip)
         {
             esp_netif_t *eth = ethernet_manager_get_netif();
-            if (eth) esp_netif_set_default_netif(eth);
+            if (eth)
+                esp_netif_set_default_netif(eth);
             gateway_set_state(GW_STATE_ETH_ONLINE);
         }
 
@@ -302,8 +310,6 @@ static void net_monitor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
-
-
 
 /* ---------------- HTTP server handlers ---------------- */
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -855,7 +861,8 @@ static void mqtt_publish_task(void *pvParameters)
                             pdFALSE, pdFALSE,
                             portMAX_DELAY);
         // 2) nếu auth fail thì báo rõ và skip (đỡ hiểu nhầm “vẫn chạy”)
-        if (s_mqtt_auth_failed) {
+        if (s_mqtt_auth_failed)
+        {
             ESP_LOGE("MQTT", "Skip publish: AUTH_FAIL (check username/password/ACL)");
             // bạn có thể set state riêng: GW_STATE_MQTT_AUTH_FAIL
             vTaskDelay(pdMS_TO_TICKS(5000));
@@ -863,11 +870,12 @@ static void mqtt_publish_task(void *pvParameters)
         }
 
         // Có mạng -> đảm bảo MQTT chạy
-        //mqtt_manager_start();
+        // mqtt_manager_start();
 
         EventBits_t b = xEventGroupWaitBits(s_mqtt_event_group, MQTT_CONNECTED_BIT,
-                                        pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
-        if (!(b & MQTT_CONNECTED_BIT) || !mqtt_client) {
+                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
+        if (!(b & MQTT_CONNECTED_BIT) || !mqtt_client)
+        {
             ESP_LOGW("MQTT", "Not connected -> skip this cycle");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
@@ -898,7 +906,7 @@ static void mqtt_publish_task(void *pvParameters)
                 char status[32];
                 bool ok = (k == 0) ? m.pzem1_ok : m.pzem2_ok;
                 pzem_status_str(status, sizeof(status), p, m.slave_id, ok);
-                //get timestamp
+                // get timestamp
                 uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
                 char payload[256];
                 int len = snprintf(payload, sizeof(payload),
@@ -1222,11 +1230,15 @@ static void mqtt_cmd_task(void *arg)
             {
                 uint32_t to = (c.timeout_s > 0) ? (uint32_t)c.timeout_s : 0;
                 esp_err_t te = modbus_pzem_port_arm_timeout(c.port, to);
-                if (te != ESP_OK) {
+                if (te != ESP_OK)
+                {
                     ESP_LOGW("CMD", "arm_timeout fail port%02u err=%s", c.port, esp_err_to_name(te));
-                } else {
+                }
+                else
+                {
                     uint32_t remain;
-                    if (modbus_pzem_port_get_remaining(c.port, &remain)) {
+                    if (modbus_pzem_port_get_remaining(c.port, &remain))
+                    {
                         if (remain == 0xFFFFFFFFu)
                             ESP_LOGI("CMD", "port%02u ON (no timeout)", c.port);
                         else
@@ -1237,9 +1249,12 @@ static void mqtt_cmd_task(void *arg)
             else if (strcmp(c.cmd, "stop_charge") == 0)
             {
                 esp_err_t te = modbus_pzem_port_clear_state(c.port);
-                if (te != ESP_OK) {
+                if (te != ESP_OK)
+                {
                     ESP_LOGW("CMD", "clear_state fail port%02u err=%s", c.port, esp_err_to_name(te));
-                } else {
+                }
+                else
+                {
                     ESP_LOGI("CMD", "port%02u OFF (timeout cleared)", c.port);
                 }
             }
@@ -1265,10 +1280,10 @@ static void mqtt_cmd_task(void *arg)
     }
 }
 
-
 static esp_err_t mqtt_publish_status_gateway(void)
 {
-    if (!mqtt_client) return ESP_ERR_INVALID_STATE;
+    if (!mqtt_client)
+        return ESP_ERR_INVALID_STATE;
 
     // 1) Timestamp
     uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
@@ -1284,22 +1299,32 @@ static esp_err_t mqtt_publish_status_gateway(void)
     for (uint8_t i = 0; i < meter_cnt; i++)
     {
         stm32_meter_t m;
-        if (!modbus_pzem_get_meter(i, &m)) continue;
+        if (!modbus_pzem_get_meter(i, &m))
+            continue;
 
         // PZEM1
-        if (m.pzem1_ok && m.pzem1.voltage_v > 1.0f) {
-            active_ports++;
+        if (m.pzem1_ok && m.pzem1.voltage_v > 1.0f)
+        {
             total_power_w += (double)m.pzem1.power_w;
             grid_v_sum += (double)m.pzem1.voltage_v;
             grid_v_cnt++;
         }
 
         // PZEM2
-        if (m.pzem2_ok && m.pzem2.voltage_v > 1.0f) {
-            active_ports++;
+        if (m.pzem2_ok && m.pzem2.voltage_v > 1.0f)
+        {
+
             total_power_w += (double)m.pzem2.power_w;
             grid_v_sum += (double)m.pzem2.voltage_v;
             grid_v_cnt++;
+        }
+        if (m.pzem1_ok)
+        {
+            active_ports++;
+        }
+        if (m.pzem2_ok)
+        {
+            active_ports++;
         }
     }
 
@@ -1307,7 +1332,8 @@ static esp_err_t mqtt_publish_status_gateway(void)
 
     // 3) Nhiệt độ chip ESP32-S3 (nếu bạn đã thêm gw_temp)
     float temp_c = 0.0f;
-    if (gw_temp_read_celsius(&temp_c) != ESP_OK) {
+    if (gw_temp_read_celsius(&temp_c) != ESP_OK)
+    {
         temp_c = 0.0f;
     }
 
@@ -1334,13 +1360,15 @@ static esp_err_t mqtt_publish_status_gateway(void)
                        grid_voltage,
                        temp_c);
 
-    if (len <= 0 || len >= (int)sizeof(payload)) {
+    if (len <= 0 || len >= (int)sizeof(payload))
+    {
         ESP_LOGW("MQTT", "GW summary payload too long -> skip");
         return ESP_FAIL;
     }
 
     int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
-    if (msg_id < 0) {
+    if (msg_id < 0)
+    {
         ESP_LOGW("MQTT", "GW summary publish failed topic=%s", topic);
         return ESP_FAIL;
     }
@@ -1359,24 +1387,27 @@ static void mqtt_publish_gateway_status_task(void *pvParameters)
                             pdFALSE, pdFALSE,
                             portMAX_DELAY);
 
-        if (s_mqtt_auth_failed) {
+        if (s_mqtt_auth_failed)
+        {
             ESP_LOGE("MQTT", "Skip GW status publish: AUTH_FAIL");
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
         }
 
-        //mqtt_manager_start();
+        // mqtt_manager_start();
 
         EventBits_t b = xEventGroupWaitBits(s_mqtt_event_group, MQTT_CONNECTED_BIT,
                                             pdFALSE, pdFALSE, pdMS_TO_TICKS(5000));
-        if (!(b & MQTT_CONNECTED_BIT) || !mqtt_client) {
+        if (!(b & MQTT_CONNECTED_BIT) || !mqtt_client)
+        {
             ESP_LOGW("MQTT", "Not connected -> skip GW status cycle");
             vTaskDelay(pdMS_TO_TICKS(2000));
             continue;
         }
 
         // Publish summary/status gateway
-        if (mqtt_publish_status_gateway() == ESP_OK) {
+        if (mqtt_publish_status_gateway() == ESP_OK)
+        {
             // bạn muốn thì set state riêng
             // gateway_set_state(GW_STATE_SENDING_GW_STATUS);
             status_led_pulse_green(250);
@@ -1386,7 +1417,6 @@ static void mqtt_publish_gateway_status_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
-
 
 /* ---------------- main ---------------- */
 void app_main(void)
@@ -1416,12 +1446,11 @@ void app_main(void)
     // MQTT publish task tạo 1 lần từ boot (tự chờ internet)
     xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
     xTaskCreate(mqtt_publish_gateway_status_task,
-            "mqtt_gw_status",
-            4096,
-            NULL,
-            5,
-            NULL);
-
+                "mqtt_gw_status",
+                4096,
+                NULL,
+                5,
+                NULL);
 
     s_cmd_q = xQueueCreate(10, sizeof(gw_cmd_t));
     xTaskCreate(mqtt_cmd_task, "mqtt_cmd_task", 4096, NULL, 7, NULL);
