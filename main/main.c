@@ -1245,6 +1245,7 @@ static void mqtt_cmd_task(void *arg)
                             ESP_LOGI("CMD", "port%02u timeout remaining=%us", c.port, (unsigned)remain);
                     }
                 }
+                modbus_pzem_port_reset_delay(c.port, 2000);
             }
             else if (strcmp(c.cmd, "stop_charge") == 0)
             {

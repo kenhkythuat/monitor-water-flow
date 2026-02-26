@@ -12,9 +12,23 @@
 
 
 static const char *TAG = "modbus_pzem";
+static const char *TAG_RST = "modbus_pzem_rst";
 static SemaphoreHandle_t s_uart_mutex;
 
+#define STM32_RESET_REG   0x0110
+#define STM32_RESET_VALUE 0x0001
 
+typedef struct {
+    uint8_t slave_id;
+    uint32_t delay_ms;
+} stm32_reset_job_t;
+
+#define RESET_WORKER_STACK     4096   // tăng stack (words). Nếu vẫn overflow, nâng 6144.
+#define RESET_WORKER_PRIORITY  10
+#define RESET_Q_LEN            8
+
+static QueueHandle_t s_reset_q = NULL;
+static TaskHandle_t  s_reset_task = NULL;
 // ===================== CRC16 MODBUS =====================
 static uint16_t modbus_crc16(const uint8_t *buf, uint16_t len)
 {
@@ -601,6 +615,94 @@ esp_err_t modbus_pzem_port_clear_state(uint8_t port_num)
     xSemaphoreGive(s_port_lock);
 
     return ESP_OK;
+}
+
+static void stm32_reset_worker(void *arg)
+{
+    (void)arg;
+    stm32_reset_job_t job;
+
+    while (1) {
+        if (xQueueReceive(s_reset_q, &job, portMAX_DELAY) != pdTRUE) continue;
+
+        ESP_LOGI(TAG_RST, "Reset job recv: slave=0x%02X delay=%ums",
+                 job.slave_id, (unsigned)job.delay_ms);
+
+        if (job.delay_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(job.delay_ms));
+        }
+
+        esp_err_t e = modbus_pzem_write_single_reg(job.slave_id, STM32_RESET_REG, STM32_RESET_VALUE);
+        if (e == ESP_OK) {
+            ESP_LOGI(TAG_RST, "Reset sent: slave=0x%02X reg=0x%04X val=0x%04X",
+                     job.slave_id, STM32_RESET_REG, STM32_RESET_VALUE);
+        } else {
+            ESP_LOGW(TAG_RST, "Reset FAIL: slave=0x%02X err=%s",
+                     job.slave_id, esp_err_to_name(e));
+        }
+
+        // debug stack watermark (giúp bạn biết còn dư bao nhiêu stack)
+        UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG_RST, "Reset worker stack highwater=%u words", (unsigned)hw);
+    }
+}
+
+static esp_err_t ensure_reset_worker(void)
+{
+    if (s_reset_q && s_reset_task) return ESP_OK;
+
+    s_reset_q = xQueueCreate(RESET_Q_LEN, sizeof(stm32_reset_job_t));
+    if (!s_reset_q) return ESP_ERR_NO_MEM;
+
+    BaseType_t ok = xTaskCreate(stm32_reset_worker,
+                                "stm32_rst_w",
+                                RESET_WORKER_STACK,
+                                NULL,
+                                RESET_WORKER_PRIORITY,
+                                &s_reset_task);
+    if (ok != pdPASS) {
+        vQueueDelete(s_reset_q);
+        s_reset_q = NULL;
+        s_reset_task = NULL;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t modbus_pzem_stm32_reset_now(uint8_t slave_id)
+{
+    return modbus_pzem_write_single_reg(slave_id, STM32_RESET_REG, STM32_RESET_VALUE);
+}
+
+esp_err_t modbus_pzem_stm32_reset_delay(uint8_t slave_id, uint32_t delay_ms)
+{
+    esp_err_t e = ensure_reset_worker();
+    if (e != ESP_OK) return e;
+
+    stm32_reset_job_t job = {
+        .slave_id = slave_id,
+        .delay_ms = delay_ms,
+    };
+
+    if (xQueueSend(s_reset_q, &job, 0) != pdTRUE) {
+        ESP_LOGW(TAG_RST, "Reset queue full, drop slave=0x%02X", slave_id);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG_RST, "Reset scheduled: slave=0x%02X in %ums",
+             slave_id, (unsigned)delay_ms);
+    return ESP_OK;
+}
+
+esp_err_t modbus_pzem_port_reset_delay(uint8_t port_num, uint32_t delay_ms)
+{
+    uint8_t slave = 0;
+    uint16_t reg_dummy = 0;
+
+    if (!modbus_pzem_map_port_to_slave_reg(port_num, &slave, &reg_dummy)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return modbus_pzem_stm32_reset_delay(slave, delay_ms);
 }
 
 

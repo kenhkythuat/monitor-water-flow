@@ -89,6 +89,18 @@ esp_err_t modbus_pzem_port_arm_timeout(uint8_t port_num, uint32_t timeout_s);
 // Khi tắt port thành công, gọi hàm này để clear state
 esp_err_t modbus_pzem_port_clear_state(uint8_t port_num);
 
+// ===== STM32 Reset helper =====
+
+// Gửi reset ngay (FC06 reg 0x0110 val 0x0001)
+esp_err_t modbus_pzem_stm32_reset_now(uint8_t slave_id);
+
+// Schedule reset sau delay_ms (không block caller)
+esp_err_t modbus_pzem_stm32_reset_delay(uint8_t slave_id, uint32_t delay_ms);
+
+// Schedule reset theo port (port -> slave mapping), sau delay_ms
+esp_err_t modbus_pzem_port_reset_delay(uint8_t port_num, uint32_t delay_ms);
+
+
 
 
 
