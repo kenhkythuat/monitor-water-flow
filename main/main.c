@@ -25,6 +25,8 @@
 #include "gateway_config.h"
 #include "gw_time.h"
 #include "gw_temp.h"
+#include "ech306l_modbus.h"
+#include "freertos/queue.h"
 
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
@@ -38,6 +40,18 @@
 static const char *TAG = "wifi_setup";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
+
+static ech306l_handle_t s_ech = NULL;
+typedef struct {
+    float distance_cm;
+    float temperature_c;
+    uint32_t ts_ms;
+    esp_err_t last_err;
+} sensor_msg_t;
+static QueueHandle_t g_sensor_q = NULL;
+
+float g_distance_cm;
+float g_temperature_c;
 
 static int pending_ack_id = -1;
 static bool ack_flag = false;
@@ -135,38 +149,6 @@ static void delayed_restart_task(void *arg)
     esp_restart();
 }
 
-// static void mqtt_manager_start(void)
-// {
-//     if (mqtt_client)
-//         return;
-
-//     gateway_set_state(GW_STATE_MQTT_CONNECTING);
-
-//     esp_mqtt_client_config_t mqtt_cfg = {
-//         .broker.address.uri = gateway_config_mqtt_uri(),
-//         .credentials.username = gateway_config_mqtt_user(),
-//         .credentials.authentication.password = gateway_config_mqtt_pass(),
-//         .credentials.client_id = gateway_config_mqtt_client_id(),
-//         .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
-//     };
-
-//     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-//     if (!mqtt_client)
-//     {
-//         ESP_LOGE("MQTT", "Failed to init client");
-//         return;
-//     }
-
-//     esp_mqtt_client_register_event(mqtt_client, MQTT_EVENT_ANY, mqtt_event_handler, NULL);
-//     esp_err_t err = esp_mqtt_client_start(mqtt_client);
-//     if (err != ESP_OK)
-//     {
-//         ESP_LOGE("MQTT", "Failed to start: %s", esp_err_to_name(err));
-//         esp_mqtt_client_destroy(mqtt_client);
-//         mqtt_client = NULL;
-//         return;
-//     }
-// }
 void mqtt_manager_init(void)
 {
     if (!s_mqtt_start_lock)
@@ -1282,7 +1264,7 @@ static void mqtt_cmd_task(void *arg)
 }
 
 static esp_err_t mqtt_publish_status_gateway(void)
-{
+{   
     if (!mqtt_client)
         return ESP_ERR_INVALID_STATE;
 
@@ -1349,17 +1331,17 @@ static esp_err_t mqtt_publish_status_gateway(void)
                        "{"
                        "\"ts\":%u,"
                        "\"summary\":{"
-                       "\"active_ports\":%d,"
-                       "\"total_power\":%.0f,"
-                       "\"grid_voltage\":%.1f,"
-                       "\"temperature\":%.1f"
+                       "\"distance_mm\":%.1f,"
+                       "\"sensor_status\":%s,"
+                       "\"level_percent\":%.1f,"
+                       "\"temperature_c\":%.1f"
                        "}"
                        "}",
                        (unsigned)ts,
-                       active_ports,
-                       total_power_w,
-                       grid_voltage,
-                       temp_c);
+                       g_distance_cm,
+                       "ok",
+                       62.3,
+                       g_temperature_c);
 
     if (len <= 0 || len >= (int)sizeof(payload))
     {
@@ -1379,7 +1361,7 @@ static esp_err_t mqtt_publish_status_gateway(void)
 }
 
 static void mqtt_publish_gateway_status_task(void *pvParameters)
-{
+{    
     while (1)
     {
         // Chờ có ít nhất 1 mạng OK (WiFi hoặc ETH)
@@ -1419,6 +1401,23 @@ static void mqtt_publish_gateway_status_task(void *pvParameters)
     }
 }
 
+static void ech_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+    float d_cm, t_c;
+    if (ech306l_read_distance_cm(s_ech, &d_cm) == ESP_OK &&
+        ech306l_read_temperature_c(s_ech, &t_c) == ESP_OK) {
+        ESP_LOGI(TAG, "Distance=%.2f cm | Temp=%.2f C", d_cm, t_c);
+        g_distance_cm=d_cm;
+        g_temperature_c=t_c;
+    }
+        vTaskDelay(pdMS_TO_TICKS(2000)); // đọc mỗi 1s
+    }
+
+}
+
 /* ---------------- main ---------------- */
 void app_main(void)
 {
@@ -1445,7 +1444,7 @@ void app_main(void)
     xTaskCreate(mqtt_ack_task, "mqtt_ack_task", 4096, NULL, 5, NULL);
 
     // MQTT publish task tạo 1 lần từ boot (tự chờ internet)
-    xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
+    //xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
     xTaskCreate(mqtt_publish_gateway_status_task,
                 "mqtt_gw_status",
                 4096,
@@ -1459,26 +1458,24 @@ void app_main(void)
     // Monitor mạng (ETH/WiFi) + quản lý state + stop mqtt khi mất internet
     xTaskCreate(net_monitor_task, "net_monitor_task", 4096, NULL, 7, NULL);
 
-    modbus_pzem_cfg_t mb = {
-        .rs485 = {
-            .uart_num = 2,
-            .tx_gpio = 10,
-            .rx_gpio = 12,
-            .de_gpio = 11,
-            .baudrate = 9600,
-        },
-        .slave_ids = s_slave_ids,
-        .slave_count = s_slave_count,
+    ech306l_cfg_t ech306l_cfg = {
+        .uart_num = UART_NUM_1,
+        .tx_gpio = 10,          // sửa theo board bạn
+        .rx_gpio = 12,          // sửa theo board bạn
+        .rts_gpio = 11,          // chân điều khiển DE/RE của RS485 module
+        .baudrate = 9600,
+        .parity = UART_PARITY_DISABLE,
+        .slave_id = 1,
 
-        .net_event_group = s_net_event_group,
-        .online_bits = NET_WIFI_OK_BIT | NET_ETH_OK_BIT,
-
-        .poll_period_ms = 10000,
-        .inter_request_ms = 100,
+        // Theo frame bạn test: 01 03 00 6B 00 02 ...
+        .reg_addr = 0x006B,
+        .reg_qty  = 2,
+        .timeout_ms = 300,
     };
 
-    ESP_ERROR_CHECK(modbus_pzem_init(&mb));
-    ESP_ERROR_CHECK(modbus_pzem_start());
+    ESP_ERROR_CHECK(ech306l_init(&ech306l_cfg, &s_ech));
+
+    xTaskCreate(ech_task, "ech_task", 4096, NULL, 10, NULL);
 
     // load saved credentials
     nvs_handle_t nvs;

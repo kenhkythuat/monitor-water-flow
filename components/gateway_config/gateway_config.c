@@ -10,13 +10,13 @@ static const char *NVS_NS_PRIMARY  = "nodeconfig";
 static const char *NVS_NS_FALLBACK = "gwcfg";
 
 static gateway_config_t s_cfg = {
-    .device_id = "cs_000001",
+    .device_id = "gw_000001",
     .number_device = 1,
 
-    .mqtt_uri = "mqtt://72.61.140.234:1883",
+    .mqtt_uri = "mqtt://161.248.146.170:1883",
     .mqtt_user = "thuanphat",
-    .mqtt_pass = "123456789",
-    .mqtt_client_id = "phat123",
+    .mqtt_pass = "",
+    .mqtt_client_id = "apm_000001",
 };
 
 static esp_err_t nvs_read_str(nvs_handle_t h, const char *key, char *out, size_t out_sz)

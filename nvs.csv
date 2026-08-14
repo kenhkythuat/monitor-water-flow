@@ -1,11 +1,11 @@
 # Sample csv file
 key,type,encoding,value
 nodeconfig,namespace
-device_id,data,string,cs_000001
+device_id,data,string,gw_000001
 number_device,data,u32,2
-mqtt_uri,data,string,mqtt://72.61.140.234:1883
+mqtt_uri,data,string,mqtt://161.248.146.170:1883
 mqtt_user,data,string,thuanphat
-mqtt_pass,data,string,123456789
-mqtt_client_id,data,string,phat123
+mqtt_pass,data,string,
+mqtt_client_id,data,string,apm_000001
 
 
