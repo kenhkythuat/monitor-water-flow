@@ -1,6 +1,6 @@
 {
   "version": "1.0.2",
-  "build": 2,
+  "build": 3,
   "target": "esp32s3",
   "project": "gateway_apartment",
   "firmware_url": "https://raw.githubusercontent.com/kenhkythuat/monitor-water-flow/main/releases/esp32s3/gateway_charging_station.bin"
