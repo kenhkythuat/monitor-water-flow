@@ -26,6 +26,7 @@
 #include "gateway_config.h"
 #include "gw_time.h"
 #include "gw_temp.h"
+#include "github_ota.h"
 #include "water_meter_modbus.h"
 #include "freertos/queue.h"
 #include "driver/uart.h"
@@ -639,6 +640,8 @@ static void net_monitor_task(void *arg)
 
             // SNTP/time sync: chỉ gọi khi vừa có mạng lần đầu
             gw_time_init();
+
+            github_ota_start_version_check();
 
             // MQTT: start khi có mạng
             mqtt_manager_start();
@@ -1890,6 +1893,7 @@ static void water_meter_task(void *arg)
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    github_ota_mark_app_valid_after_boot();
     ESP_ERROR_CHECK(gateway_config_init());
     ESP_ERROR_CHECK(build_slave_list_from_nvs());
     ESP_ERROR_CHECK(esp_netif_init());
