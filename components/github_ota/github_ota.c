@@ -23,7 +23,7 @@
 #endif
 
 #ifndef GITHUB_OTA_CURRENT_BUILD
-#define GITHUB_OTA_CURRENT_BUILD 2
+#define GITHUB_OTA_CURRENT_BUILD 5
 #endif
 
 #ifndef GITHUB_OTA_VERSION_URL
@@ -247,8 +247,13 @@ static esp_err_t github_ota_fetch_version_json(char *json_buf, size_t json_buf_s
         return ESP_ERR_INVALID_ARG;
     }
 
+    char version_url[GITHUB_OTA_URL_MAX_SIZE + 32];
+    snprintf(version_url, sizeof(version_url), "%s?cb=%lu",
+             GITHUB_OTA_VERSION_URL,
+             (unsigned long)xTaskGetTickCount());
+
     esp_http_client_config_t config = {
-        .url = GITHUB_OTA_VERSION_URL,
+        .url = version_url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = GITHUB_OTA_HTTP_TIMEOUT_MS,
         .keep_alive_enable = true,
@@ -258,6 +263,9 @@ static esp_err_t github_ota_fetch_version_json(char *json_buf, size_t json_buf_s
     if (client == NULL) {
         return ESP_FAIL;
     }
+
+    esp_http_client_set_header(client, "Cache-Control", "no-cache");
+    esp_http_client_set_header(client, "Pragma", "no-cache");
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {

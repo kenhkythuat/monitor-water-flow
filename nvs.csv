@@ -12,4 +12,4 @@ water_baudrate,data,u32,9600
 water_poll_ms,data,u32,2000
 water_report_s,data,u32,15
 storage,namespace,,
-ota_build,data,u32,2
+ota_build,data,u32,5
