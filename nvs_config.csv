@@ -1,7 +1,18 @@
-# Sample csv file
+# NVS config for gateway_apartment / monitor-water-flow
 key,type,encoding,value
-keyconfig,namespace,,
-devEui,data,string,07F0430D30DD0601
-appEui,data,string,0940AF0550C80601
-appKey,data,string,07F0430D30DD06013306D0CA0070230F
+nodeconfig,namespace,,
+device_id,data,string,gw_wtr_001
+number_device,data,u32,1
+mqtt_uri,data,string,mqtt://161.248.146.170:1883
+mqtt_user,data,string,thuanphat
+mqtt_pass,data,string,
+mqtt_client_id,data,string,gw_wtr_001
+water_slave_id,data,u32,16
+water_baudrate,data,u32,9600
+water_poll_ms,data,u32,2000
+water_report_s,data,u32,15
+storage,namespace,,
+ota_build,data,u32,2
+wifi_ssid,data,string,
+wifi_pass,data,string,
 
