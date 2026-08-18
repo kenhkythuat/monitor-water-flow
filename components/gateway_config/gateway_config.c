@@ -10,13 +10,18 @@ static const char *NVS_NS_PRIMARY  = "nodeconfig";
 static const char *NVS_NS_FALLBACK = "gwcfg";
 
 static gateway_config_t s_cfg = {
-    .device_id = "gw_000001",
+    .device_id = "gw_wtr_001",
     .number_device = 1,
 
     .mqtt_uri = "mqtt://161.248.146.170:1883",
     .mqtt_user = "thuanphat",
     .mqtt_pass = "",
-    .mqtt_client_id = "apm_000001",
+    .mqtt_client_id = "gw_wtr_001",
+
+    .water_slave_id = 1,
+    .water_baudrate = 9600,
+    .water_poll_period_ms = 2000,
+    .water_report_interval_s = 15,
 };
 
 static esp_err_t nvs_read_str(nvs_handle_t h, const char *key, char *out, size_t out_sz)
@@ -103,18 +108,43 @@ esp_err_t gateway_config_init(void)
     load_or_write_str(h, "mqtt_user",      s_cfg.mqtt_user,      sizeof(s_cfg.mqtt_user),      s_cfg.mqtt_user);
     load_or_write_str(h, "mqtt_pass",      s_cfg.mqtt_pass,      sizeof(s_cfg.mqtt_pass),      s_cfg.mqtt_pass);
     load_or_write_str(h, "mqtt_client_id", s_cfg.mqtt_client_id, sizeof(s_cfg.mqtt_client_id), s_cfg.mqtt_client_id);
+    load_or_write_u32(h, "water_slave_id", &s_cfg.water_slave_id, s_cfg.water_slave_id);
+    load_or_write_u32(h, "water_baudrate", &s_cfg.water_baudrate, s_cfg.water_baudrate);
+    load_or_write_u32(h, "water_poll_ms",  &s_cfg.water_poll_period_ms, s_cfg.water_poll_period_ms);
+    load_or_write_u32(h, "water_report_s", &s_cfg.water_report_interval_s, s_cfg.water_report_interval_s);
 
     nvs_commit(h);
     nvs_close(h);
 
+    if (s_cfg.water_slave_id == 0 || s_cfg.water_slave_id > 247) {
+        ESP_LOGW(TAG, "water_slave_id invalid=%lu -> default=1", (unsigned long)s_cfg.water_slave_id);
+        s_cfg.water_slave_id = 1;
+    }
+    if (s_cfg.water_baudrate == 0) {
+        ESP_LOGW(TAG, "water_baudrate invalid=0 -> default=9600");
+        s_cfg.water_baudrate = 9600;
+    }
+    if (s_cfg.water_poll_period_ms == 0) {
+        ESP_LOGW(TAG, "water_poll_ms invalid=0 -> default=2000");
+        s_cfg.water_poll_period_ms = 2000;
+    }
+    if (s_cfg.water_report_interval_s < 10 || s_cfg.water_report_interval_s > 3600) {
+        ESP_LOGW(TAG, "water_report_s invalid=%lu -> default=15", (unsigned long)s_cfg.water_report_interval_s);
+        s_cfg.water_report_interval_s = 15;
+    }
+
     // log (KHÔNG log pass)
-    ESP_LOGI(TAG, "Loaded(ns=%s): device_id=%s number_device=%lu mqtt_uri=%s mqtt_user=%s mqtt_client_id=%s",
+    ESP_LOGI(TAG, "Loaded(ns=%s): device_id=%s number_device=%lu mqtt_uri=%s mqtt_user=%s mqtt_client_id=%s water_slave=%lu water_baud=%lu water_poll_ms=%lu water_report_s=%lu",
              ns_used ? ns_used : "?",
              s_cfg.device_id,
              (unsigned long)s_cfg.number_device,
              s_cfg.mqtt_uri,
              s_cfg.mqtt_user,
-             s_cfg.mqtt_client_id);
+             s_cfg.mqtt_client_id,
+             (unsigned long)s_cfg.water_slave_id,
+             (unsigned long)s_cfg.water_baudrate,
+             (unsigned long)s_cfg.water_poll_period_ms,
+             (unsigned long)s_cfg.water_report_interval_s);
 
     return ESP_OK;
 }
@@ -127,6 +157,10 @@ const char *gateway_config_mqtt_uri(void)       { return s_cfg.mqtt_uri; }
 const char *gateway_config_mqtt_user(void)      { return s_cfg.mqtt_user; }
 const char *gateway_config_mqtt_pass(void)      { return s_cfg.mqtt_pass; }
 const char *gateway_config_mqtt_client_id(void) { return s_cfg.mqtt_client_id; }
+uint32_t gateway_config_water_slave_id(void)    { return s_cfg.water_slave_id; }
+uint32_t gateway_config_water_baudrate(void)    { return s_cfg.water_baudrate; }
+uint32_t gateway_config_water_poll_period_ms(void) { return s_cfg.water_poll_period_ms; }
+uint32_t gateway_config_water_report_interval_s(void) { return s_cfg.water_report_interval_s; }
 
 /* setters */
 static esp_err_t set_str_key(const char *key, const char *val, char *dst, size_t dst_sz)
@@ -168,6 +202,10 @@ esp_err_t gateway_config_set_mqtt_uri(const char *uri)      { return set_str_key
 esp_err_t gateway_config_set_mqtt_user(const char *user)    { return set_str_key("mqtt_user", user, s_cfg.mqtt_user, sizeof(s_cfg.mqtt_user)); }
 esp_err_t gateway_config_set_mqtt_pass(const char *pass)    { return set_str_key("mqtt_pass", pass, s_cfg.mqtt_pass, sizeof(s_cfg.mqtt_pass)); }
 esp_err_t gateway_config_set_mqtt_client_id(const char *cid){ return set_str_key("mqtt_client_id", cid, s_cfg.mqtt_client_id, sizeof(s_cfg.mqtt_client_id)); }
+esp_err_t gateway_config_set_water_slave_id(uint32_t slave_id) { return set_u32_key("water_slave_id", slave_id, &s_cfg.water_slave_id); }
+esp_err_t gateway_config_set_water_baudrate(uint32_t baudrate) { return set_u32_key("water_baudrate", baudrate, &s_cfg.water_baudrate); }
+esp_err_t gateway_config_set_water_poll_period_ms(uint32_t poll_period_ms) { return set_u32_key("water_poll_ms", poll_period_ms, &s_cfg.water_poll_period_ms); }
+esp_err_t gateway_config_set_water_report_interval_s(uint32_t interval_s) { return set_u32_key("water_report_s", interval_s, &s_cfg.water_report_interval_s); }
 
 esp_err_t gateway_config_get_all(gateway_config_t *out)
 {

@@ -31,7 +31,10 @@ void gateway_core_init(void)
 
 void gateway_set_state(gateway_state_t s)
 {
-    if (g_state == s) return;
+    if (g_state == s) {
+        status_led_on_state(s);
+        return;
+    }
     g_state = s;
     ESP_LOGI(TAG, "STATE -> %s", gateway_state_str(s));
     status_led_on_state(s);

@@ -1,5 +1,6 @@
 // main.c
 #include <stdio.h>
+#include <time.h>
 #include "gateway_state.h"
 #include "gateway_core.h"
 #include "status_led.h"
@@ -25,33 +26,37 @@
 #include "gateway_config.h"
 #include "gw_time.h"
 #include "gw_temp.h"
-#include "ech306l_modbus.h"
+#include "water_meter_modbus.h"
 #include "freertos/queue.h"
+#include "driver/uart.h"
 
 #define WIFI_RESET_BUTTON_GPIO 41
 #define WIFI_RESET_HOLD_TIME_MS 10000
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 
-#define LED_RED_GPIO 21
+#define LED_RED_GPIO 13
 #define LED_BLUE_GPIO 14
-#define LED_GREEN_GPIO 13
+#define LED_GREEN_GPIO 21
+#define STATUS_LED_ACTIVE_HIGH 1
+#define WATER_SCHEMA_VER "1.1"
+#define WATER_NODE_INDEX 1
+#define WATER_OFFLINE_FAILURES 3
+#define TEST_FLOW_WATER_METTER 0
 
 static const char *TAG = "wifi_setup";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 
-static ech306l_handle_t s_ech = NULL;
-typedef struct {
-    float distance_cm;
-    float temperature_c;
-    uint32_t ts_ms;
-    esp_err_t last_err;
-} sensor_msg_t;
-static QueueHandle_t g_sensor_q = NULL;
-
-float g_distance_cm;
-float g_temperature_c;
+static water_meter_handle_t s_water_meter = NULL;
+static SemaphoreHandle_t s_water_meter_lock = NULL;
+static SemaphoreHandle_t s_water_meter_io_lock = NULL;
+static water_meter_data_t s_water_meter_data = {
+    .status = WATER_METER_ERR_TIMEOUT,
+};
+static uint32_t s_water_report_interval_s = 15;
+static uint32_t s_water_consecutive_failures = 0;
+static bool s_water_offline = false;
 
 static int pending_ack_id = -1;
 static bool ack_flag = false;
@@ -93,6 +98,378 @@ static volatile uint32_t s_last_puback_ms = 0;
 static inline uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static void water_node_id(uint8_t index, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, "node_wm_%03u", (unsigned)index);
+}
+
+static const char *water_rs485_status(water_meter_status_t status)
+{
+    switch (status) {
+    case WATER_METER_OK:
+        return "ok";
+    case WATER_METER_ERR_TIMEOUT:
+        return "timeout";
+    case WATER_METER_ERR_CRC:
+        return "crc_error";
+    case WATER_METER_ERR_SLAVE_ID:
+    case WATER_METER_ERR_FUNCTION:
+    case WATER_METER_ERR_BYTE_COUNT:
+    case WATER_METER_ERR_EXCEPTION:
+    case WATER_METER_ERR_INVALID_ARG:
+        return "config_error";
+    case WATER_METER_ERR_UART:
+    default:
+        return "timeout";
+    }
+}
+
+static const char *water_meter_mqtt_status(water_meter_status_t status)
+{
+    if (s_water_offline) return "offline";
+    return (status == WATER_METER_OK) ? "ok" : "error";
+}
+
+static const char *water_data_quality(water_meter_status_t status)
+{
+    if (status == WATER_METER_OK) return "good";
+    return s_water_offline ? "bad" : "stale";
+}
+
+static const char *water_event_code(water_meter_status_t status)
+{
+    switch (status) {
+    case WATER_METER_ERR_CRC:
+        return "crc_error";
+    case WATER_METER_ERR_TIMEOUT:
+    case WATER_METER_ERR_UART:
+    default:
+        return "rs485_timeout";
+    }
+}
+
+static void iso_time_now(char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+
+    time_t t = gw_time_is_synced() ? (time_t)gw_time_unix() : 0;
+    struct tm tm_now = {0};
+    localtime_r(&t, &tm_now);
+
+    char tmp[40] = {0};
+    if (strftime(tmp, sizeof(tmp), "%Y-%m-%dT%H:%M:%S%z", &tm_now) == 0) {
+        snprintf(out, out_sz, "1970-01-01T00:00:00+00:00");
+        return;
+    }
+
+    size_t len = strlen(tmp);
+    if (len == 24) {
+        snprintf(out, out_sz, "%.22s:%.2s", tmp, tmp + 22);
+    } else {
+        snprintf(out, out_sz, "%s", tmp);
+    }
+}
+
+static const char *current_network_name(void)
+{
+    if (ethernet_manager_has_ip()) return "ethernet";
+    if (xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT) return "wifi";
+    return "unknown";
+}
+
+static int current_rssi_dbm(void)
+{
+    wifi_ap_record_t ap = {0};
+    if ((xEventGroupGetBits(s_net_event_group) & NET_WIFI_OK_BIT) &&
+        esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        return ap.rssi;
+    }
+    return -127;
+}
+
+static bool parse_water_node_from_topic(const char *topic, uint8_t *out_node_index)
+{
+    const char *prefix = "tbmq/water/";
+    const char *node_prefix = "/node_wm_";
+    if (!topic || !out_node_index || strncmp(topic, prefix, strlen(prefix)) != 0) {
+        return false;
+    }
+
+    const char *node = strstr(topic + strlen(prefix), node_prefix);
+    if (!node) return false;
+
+    node += strlen(node_prefix);
+    int idx = atoi(node);
+    if (idx <= 0 || idx > 999) return false;
+
+    *out_node_index = (uint8_t)idx;
+    return true;
+}
+
+static bool water_node_is_configured(uint8_t node_index)
+{
+    return node_index == WATER_NODE_INDEX && gateway_config_number_device() >= WATER_NODE_INDEX;
+}
+
+static esp_err_t mqtt_publish_water_ack(uint8_t node_index,
+                                        const char *request_id,
+                                        const char *ack_to,
+                                        const char *result,
+                                        const char *description)
+{
+    if (!mqtt_client) return ESP_ERR_INVALID_STATE;
+
+    char node_id[20];
+    water_node_id(node_index, node_id, sizeof(node_id));
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "tbmq/water/%s/%s/ack", gateway_config_device_id(), node_id);
+
+    uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
+    char payload[256];
+    int len = snprintf(payload, sizeof(payload),
+                       "{"
+                       "\"ts\":%u,"
+                       "\"request_id\":\"%s\","
+                       "\"ack_to\":\"%s\","
+                       "\"result\":\"%s\","
+                       "\"description\":\"%s\""
+                       "}",
+                       (unsigned)ts,
+                       request_id ? request_id : "",
+                       ack_to ? ack_to : "",
+                       result ? result : "error",
+                       description ? description : "internal_error");
+    if (len <= 0 || len >= (int)sizeof(payload)) return ESP_FAIL;
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+    ESP_LOGI("MQTT", "Water ACK msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t mqtt_publish_water_event(uint8_t node_index,
+                                          const char *event_code,
+                                          const char *severity,
+                                          const char *description,
+                                          uint32_t consecutive_failures)
+{
+    if (!mqtt_client) return ESP_ERR_INVALID_STATE;
+
+    char node_id[20];
+    water_node_id(node_index, node_id, sizeof(node_id));
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "tbmq/water/%s/%s/event", gateway_config_device_id(), node_id);
+
+    uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
+    char payload[320];
+    int len = snprintf(payload, sizeof(payload),
+                       "{"
+                       "\"ts\":%u,"
+                       "\"schema_ver\":\"%s\","
+                       "\"event_code\":\"%s\","
+                       "\"severity\":\"%s\","
+                       "\"description\":\"%s\","
+                       "\"data\":{\"consecutive_failures\":%lu}"
+                       "}",
+                       (unsigned)ts,
+                       WATER_SCHEMA_VER,
+                       event_code,
+                       severity,
+                       description,
+                       (unsigned long)consecutive_failures);
+    if (len <= 0 || len >= (int)sizeof(payload)) return ESP_FAIL;
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 0);
+    ESP_LOGI("MQTT", "Water event msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t mqtt_publish_water_node_telemetry(uint8_t node_index, const water_meter_data_t *water)
+{
+    if (!mqtt_client || !water) return ESP_ERR_INVALID_ARG;
+    if (water->status != WATER_METER_OK) return ESP_ERR_INVALID_STATE;
+
+    char node_id[20];
+    water_node_id(node_index, node_id, sizeof(node_id));
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "tbmq/water/%s/%s/telemetry", gateway_config_device_id(), node_id);
+
+    char time_device[40];
+    iso_time_now(time_device, sizeof(time_device));
+
+    uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
+    char payload[384];
+    int len = snprintf(payload, sizeof(payload),
+                       "{"
+                       "\"ts\":%u,"
+                       "\"schema_ver\":\"%s\","
+                       "\"data\":{"
+                       "\"time_device\":\"%s\","
+                       "\"total_volume_m3\":%.2f,"
+                       "\"meter_status\":\"%s\","
+                       "\"rs485_status\":\"%s\","
+                       "\"data_quality\":\"%s\""
+                       "}"
+                       "}",
+                       (unsigned)ts,
+                       WATER_SCHEMA_VER,
+                       time_device,
+                       water->total_volume_m3,
+                       water_meter_mqtt_status(water->status),
+                       water_rs485_status(water->status),
+                       water_data_quality(water->status));
+    if (len <= 0 || len >= (int)sizeof(payload)) {
+        ESP_LOGW("MQTT", "Water node payload too long");
+        return ESP_FAIL;
+    }
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, 0);
+    ESP_LOGI("MQTT", "Water telemetry msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t mqtt_publish_water_gateway_summary(void)
+{
+    if (!mqtt_client) return ESP_ERR_INVALID_STATE;
+
+    water_meter_data_t water = {0};
+    water.status = WATER_METER_ERR_TIMEOUT;
+    if (s_water_meter_lock) {
+        xSemaphoreTake(s_water_meter_lock, portMAX_DELAY);
+        water = s_water_meter_data;
+        xSemaphoreGive(s_water_meter_lock);
+    }
+
+    uint32_t total_nodes = gateway_config_number_device();
+    uint32_t online_nodes = (water.status == WATER_METER_OK) ? 1 : 0;
+    const char *gw_status = (online_nodes == total_nodes) ? "ok" : (online_nodes > 0 ? "warning" : "error");
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "tbmq/water/%s/telemetry", gateway_config_device_id());
+
+    uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
+    char payload[320];
+    int len = snprintf(payload, sizeof(payload),
+                       "{"
+                       "\"ts\":%u,"
+                       "\"schema_ver\":\"%s\","
+                       "\"data\":{"
+                       "\"gw_status\":\"%s\","
+                       "\"total_nodes\":%lu,"
+                       "\"online_nodes\":%lu,"
+                       "\"rssi_dbm\":%d,"
+                       "\"network\":\"%s\","
+                       "\"uptime_s\":%lu"
+                       "}"
+                       "}",
+                       (unsigned)ts,
+                       WATER_SCHEMA_VER,
+                       gw_status,
+                       (unsigned long)total_nodes,
+                       (unsigned long)online_nodes,
+                       current_rssi_dbm(),
+                       current_network_name(),
+                       (unsigned long)(now_ms() / 1000U));
+    if (len <= 0 || len >= (int)sizeof(payload)) return ESP_FAIL;
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, 0);
+    ESP_LOGI("MQTT", "Water gateway summary msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t mqtt_publish_water_status(const char *status, const char *reason)
+{
+    if (!mqtt_client) return ESP_ERR_INVALID_STATE;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "tbmq/water/%s/status", gateway_config_device_id());
+
+    uint32_t ts = gw_time_is_synced() ? gw_time_unix() : 0;
+    char payload[160];
+    int len = snprintf(payload, sizeof(payload),
+                       "{\"ts\":%u,\"status\":\"%s\",\"reason\":\"%s\"}",
+                       (unsigned)ts, status, reason);
+    if (len <= 0 || len >= (int)sizeof(payload)) return ESP_FAIL;
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, 1);
+    ESP_LOGI("MQTT", "Water status msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
+    return (msg_id >= 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t water_meter_poll_once(water_meter_data_t *out)
+{
+    if (!s_water_meter || !out) return ESP_ERR_INVALID_ARG;
+
+#if TEST_FLOW_WATER_METTER
+    static uint32_t s_test_start_ms = 0;
+    if (s_test_start_ms == 0) {
+        s_test_start_ms = now_ms();
+    }
+
+    uint32_t elapsed_min = (now_ms() - s_test_start_ms) / 60000U;
+    water_meter_data_t data = {
+        .raw_total_volume = elapsed_min * 100U,
+        .total_volume_liter = (uint64_t)elapsed_min * 1000ULL,
+        .total_volume_m3 = (float)elapsed_min,
+        .flow_liter_per_minute = 1000.0f / 60.0f,
+        .flow_valid = true,
+        .ts_ms = now_ms(),
+        .status = WATER_METER_OK,
+        .exception_code = 0,
+    };
+
+    xSemaphoreTake(s_water_meter_lock, portMAX_DELAY);
+    s_water_meter_data = data;
+    s_water_consecutive_failures = 0;
+    s_water_offline = false;
+    *out = data;
+    xSemaphoreGive(s_water_meter_lock);
+
+    return ESP_OK;
+#else
+    if (s_water_meter_io_lock) xSemaphoreTake(s_water_meter_io_lock, portMAX_DELAY);
+    water_meter_data_t data = {0};
+    esp_err_t err = water_meter_read_total(s_water_meter, &data);
+    if (s_water_meter_io_lock) xSemaphoreGive(s_water_meter_io_lock);
+
+    xSemaphoreTake(s_water_meter_lock, portMAX_DELAY);
+    if (err == ESP_OK) {
+        bool was_offline = s_water_offline;
+        s_water_meter_data = data;
+        s_water_consecutive_failures = 0;
+        s_water_offline = false;
+        *out = data;
+        xSemaphoreGive(s_water_meter_lock);
+
+        if (was_offline) {
+            mqtt_publish_water_event(WATER_NODE_INDEX, "meter_online", "info",
+                                     "Water meter is responding again", 0);
+        }
+        return ESP_OK;
+    }
+
+    s_water_meter_data.status = data.status;
+    s_water_meter_data.exception_code = data.exception_code;
+    s_water_consecutive_failures++;
+    uint32_t failures = s_water_consecutive_failures;
+    bool just_offline = !s_water_offline && failures >= WATER_OFFLINE_FAILURES;
+    if (just_offline) s_water_offline = true;
+    *out = s_water_meter_data;
+    xSemaphoreGive(s_water_meter_lock);
+
+    const char *code = water_event_code(data.status);
+    mqtt_publish_water_event(WATER_NODE_INDEX,
+                             just_offline ? "meter_offline" : code,
+                             just_offline ? "error" : "warning",
+                             just_offline ? "Water meter reached offline threshold" : "Water meter read failed",
+                             failures);
+
+    return ESP_FAIL;
+#endif
 }
 
 static esp_err_t build_slave_list_from_nvs(void)
@@ -180,12 +557,21 @@ void mqtt_manager_start(void)
 
     gateway_set_state(GW_STATE_MQTT_CONNECTING);
 
+    char will_topic[128];
+    snprintf(will_topic, sizeof(will_topic), "tbmq/water/%s/status", gateway_config_device_id());
+    static const char will_payload[] = "{\"status\":\"offline\",\"reason\":\"connection_lost\"}";
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = gateway_config_mqtt_uri(),
         .credentials.username = gateway_config_mqtt_user(),
         .credentials.authentication.password = gateway_config_mqtt_pass(),
         .credentials.client_id = gateway_config_mqtt_client_id(),
         .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+        .session.last_will.topic = will_topic,
+        .session.last_will.msg = will_payload,
+        .session.last_will.msg_len = sizeof(will_payload) - 1,
+        .session.last_will.qos = 1,
+        .session.last_will.retain = true,
     };
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
@@ -508,15 +894,10 @@ static void mqtt_event_handler(void *handler_args,
         gateway_set_state(GW_STATE_MQTT_CONNECTED);
 
         char sub_cmd[128];
-        snprintf(sub_cmd, sizeof(sub_cmd), "tbmq/%s/+/command", gateway_config_device_id());
-        esp_mqtt_client_subscribe(event->client, sub_cmd, 0);
+        snprintf(sub_cmd, sizeof(sub_cmd), "tbmq/water/%s/+/command", gateway_config_device_id());
+        esp_mqtt_client_subscribe(event->client, sub_cmd, 1);
         ESP_LOGI("MQTT", "Subscribed to %s", sub_cmd);
-        // (tuỳ chọn) config topic riêng
-        char sub_cfg[128];
-        snprintf(sub_cfg, sizeof(sub_cfg), "tbmq/%s/config", gateway_config_device_id());
-        esp_mqtt_client_subscribe(event->client, sub_cfg, 0);
-
-        ESP_LOGI("MQTT", "Subscribed to %s", sub_cfg);
+        mqtt_publish_water_status("online", "connected");
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI("MQTT", "Subscribed, msg_id=%d", event->msg_id);
@@ -588,6 +969,69 @@ static void mqtt_event_handler(void *handler_args,
         }
 
         const char *cmd = cmd_obj->valuestring;
+
+        if (strstr(topic_buf, "/command") != NULL && strncmp(topic_buf, "tbmq/water/", 11) == 0)
+        {
+            cJSON *request_id_obj = cJSON_GetObjectItem(json, "request_id");
+            const char *request_id = cJSON_IsString(request_id_obj) ? request_id_obj->valuestring : "";
+
+            uint8_t node_index = 0;
+            if (!parse_water_node_from_topic(topic_buf, &node_index) || !water_node_is_configured(node_index))
+            {
+                ESP_LOGW("MQTT", "Water command node not found topic=%s", topic_buf);
+                if (node_index == 0) node_index = WATER_NODE_INDEX;
+                mqtt_publish_water_ack(node_index, request_id, cmd, "error", "node_not_found");
+                cJSON_Delete(json);
+                break;
+            }
+
+            if (strcmp(cmd, "set_report_interval") == 0)
+            {
+                cJSON *interval = cJSON_IsObject(param) ? cJSON_GetObjectItem(param, "interval_s") : NULL;
+                if (!cJSON_IsNumber(interval) || interval->valuedouble < 10 || interval->valuedouble > 3600)
+                {
+                    mqtt_publish_water_ack(node_index, request_id, cmd, "error", "invalid_param");
+                    cJSON_Delete(json);
+                    break;
+                }
+
+                uint32_t interval_s = (uint32_t)interval->valuedouble;
+                esp_err_t cfg_err = gateway_config_set_water_report_interval_s(interval_s);
+                if (cfg_err == ESP_OK)
+                {
+                    s_water_report_interval_s = interval_s;
+                    mqtt_publish_water_ack(node_index, request_id, cmd, "ok", "interval_updated");
+                }
+                else
+                {
+                    mqtt_publish_water_ack(node_index, request_id, cmd, "error", "internal_error");
+                }
+                cJSON_Delete(json);
+                break;
+            }
+
+            if (strcmp(cmd, "poll_now") == 0)
+            {
+                water_meter_data_t water = {0};
+                esp_err_t poll_err = water_meter_poll_once(&water);
+                if (poll_err == ESP_OK)
+                {
+                    mqtt_publish_water_node_telemetry(node_index, &water);
+                    mqtt_publish_water_ack(node_index, request_id, cmd, "ok", "poll_completed");
+                }
+                else
+                {
+                    mqtt_publish_water_ack(node_index, request_id, cmd, "error", "rs485_timeout");
+                }
+                cJSON_Delete(json);
+                break;
+            }
+
+            ESP_LOGW("MQTT", "Unknown water cmd=%s", cmd);
+            mqtt_publish_water_ack(node_index, request_id, cmd, "error", "invalid_param");
+            cJSON_Delete(json);
+            break;
+        }
 
         /* ==========================================================
            3) CMD: config_device  -> update NVS -> restart
@@ -1265,6 +1709,8 @@ static void mqtt_cmd_task(void *arg)
 
 static esp_err_t mqtt_publish_status_gateway(void)
 {   
+    return mqtt_publish_water_gateway_summary();
+#if 0
     if (!mqtt_client)
         return ESP_ERR_INVALID_STATE;
 
@@ -1320,28 +1766,40 @@ static esp_err_t mqtt_publish_status_gateway(void)
         temp_c = 0.0f;
     }
 
+    water_meter_data_t water = {0};
+    water.status = WATER_METER_ERR_TIMEOUT;
+    if (s_water_meter_lock) {
+        xSemaphoreTake(s_water_meter_lock, portMAX_DELAY);
+        water = s_water_meter_data;
+        xSemaphoreGive(s_water_meter_lock);
+    }
+
     // 4) Topic + payload
     char topic[128];
     snprintf(topic, sizeof(topic),
              "tbmq/%s/telemetry",
              gateway_config_device_id());
 
-    char payload[256];
+    char payload[384];
     int len = snprintf(payload, sizeof(payload),
                        "{"
                        "\"ts\":%u,"
                        "\"summary\":{"
-                       "\"distance_mm\":%.1f,"
-                       "\"sensor_status\":%s,"
-                       "\"level_percent\":%.1f,"
+                       "\"raw_total_volume\":%lu,"
+                       "\"total_volume_liter\":%llu,"
+                       "\"flow_liter_per_minute\":%.2f,"
+                       "\"flow_valid\":%s,"
+                       "\"water_meter_status\":\"%s\","
                        "\"temperature_c\":%.1f"
                        "}"
                        "}",
                        (unsigned)ts,
-                       g_distance_cm,
-                       "ok",
-                       62.3,
-                       g_temperature_c);
+                       (unsigned long)water.raw_total_volume,
+                       (unsigned long long)water.total_volume_liter,
+                       water.flow_liter_per_minute,
+                       water.flow_valid ? "true" : "false",
+                       water_meter_status_name(water.status),
+                       temp_c);
 
     if (len <= 0 || len >= (int)sizeof(payload))
     {
@@ -1358,6 +1816,7 @@ static esp_err_t mqtt_publish_status_gateway(void)
 
     ESP_LOGI("MQTT", "GW summary published msg_id=%d topic=%s payload=%s", msg_id, topic, payload);
     return ESP_OK;
+#endif
 }
 
 static void mqtt_publish_gateway_status_task(void *pvParameters)
@@ -1401,19 +1860,28 @@ static void mqtt_publish_gateway_status_task(void *pvParameters)
     }
 }
 
-static void ech_task(void *arg)
+static void water_meter_task(void *arg)
 {
     (void)arg;
+    uint32_t last_report_ms = 0;
 
     while (1) {
-    float d_cm, t_c;
-    if (ech306l_read_distance_cm(s_ech, &d_cm) == ESP_OK &&
-        ech306l_read_temperature_c(s_ech, &t_c) == ESP_OK) {
-        ESP_LOGI(TAG, "Distance=%.2f cm | Temp=%.2f C", d_cm, t_c);
-        g_distance_cm=d_cm;
-        g_temperature_c=t_c;
-    }
-        vTaskDelay(pdMS_TO_TICKS(2000)); // đọc mỗi 1s
+        water_meter_data_t data = {0};
+        esp_err_t err = water_meter_poll_once(&data);
+        if (err == ESP_OK) {
+            status_led_pulse_green(250);
+            uint32_t now = now_ms();
+            uint32_t interval_ms = s_water_report_interval_s * 1000U;
+            if (last_report_ms == 0 || (uint32_t)(now - last_report_ms) >= interval_ms) {
+                if (mqtt_publish_water_node_telemetry(WATER_NODE_INDEX, &data) == ESP_OK) {
+                    last_report_ms = now;
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "Water meter read failed: %s", water_meter_status_name(data.status));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(gateway_config_water_poll_period_ms()));
     }
 
 }
@@ -1435,13 +1903,12 @@ void app_main(void)
         .red_gpio = LED_RED_GPIO,
         .blue_gpio = LED_BLUE_GPIO,
         .green_gpio = LED_GREEN_GPIO,
-        .active_high = false,
+        .active_high = STATUS_LED_ACTIVE_HIGH,
     };
     ESP_ERROR_CHECK(status_led_init(&cfg)); // ✅ tạo task LED trước
     gateway_set_state(GW_STATE_ETH_CONNECTING);
     esp_err_t err = ethernet_manager_start(); // nên bỏ ESP_ERROR_CHECK để khỏi reboot
     xTaskCreate(wifi_reset_button_task, "wifi_reset_button_task", 4096, NULL, 5, NULL);
-    xTaskCreate(mqtt_ack_task, "mqtt_ack_task", 4096, NULL, 5, NULL);
 
     // MQTT publish task tạo 1 lần từ boot (tự chờ internet)
     //xTaskCreate(mqtt_publish_task, "mqtt_publish_task", 4096, NULL, 6, NULL);
@@ -1453,29 +1920,32 @@ void app_main(void)
                 NULL);
 
     s_cmd_q = xQueueCreate(10, sizeof(gw_cmd_t));
-    xTaskCreate(mqtt_cmd_task, "mqtt_cmd_task", 4096, NULL, 7, NULL);
 
     // Monitor mạng (ETH/WiFi) + quản lý state + stop mqtt khi mất internet
     xTaskCreate(net_monitor_task, "net_monitor_task", 4096, NULL, 7, NULL);
 
-    ech306l_cfg_t ech306l_cfg = {
+    s_water_meter_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_water_meter_lock ? ESP_OK : ESP_ERR_NO_MEM);
+    s_water_meter_io_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_water_meter_io_lock ? ESP_OK : ESP_ERR_NO_MEM);
+    s_water_report_interval_s = gateway_config_water_report_interval_s();
+
+    water_meter_cfg_t water_cfg = {
         .uart_num = UART_NUM_1,
         .tx_gpio = 10,          // sửa theo board bạn
         .rx_gpio = 12,          // sửa theo board bạn
         .rts_gpio = 11,          // chân điều khiển DE/RE của RS485 module
-        .baudrate = 9600,
+        .baudrate = (int)gateway_config_water_baudrate(),
         .parity = UART_PARITY_DISABLE,
-        .slave_id = 1,
+        .slave_id = (uint8_t)gateway_config_water_slave_id(),
 
-        // Theo frame bạn test: 01 03 00 6B 00 02 ...
-        .reg_addr = 0x006B,
-        .reg_qty  = 2,
         .timeout_ms = 300,
+        .retries = 2,
     };
 
-    ESP_ERROR_CHECK(ech306l_init(&ech306l_cfg, &s_ech));
+    ESP_ERROR_CHECK(water_meter_init(&water_cfg, &s_water_meter));
 
-    xTaskCreate(ech_task, "ech_task", 4096, NULL, 10, NULL);
+    xTaskCreate(water_meter_task, "water_meter_task", 4096, NULL, 10, NULL);
 
     // load saved credentials
     nvs_handle_t nvs;

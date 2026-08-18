@@ -1,11 +1,14 @@
 # Sample csv file
 key,type,encoding,value
 nodeconfig,namespace
-device_id,data,string,gw_000001
+device_id,data,string,gw_wtr_001
 number_device,data,u32,2
 mqtt_uri,data,string,mqtt://161.248.146.170:1883
-mqtt_user,data,string,thuanphat
+mqtt_user,data,string,
 mqtt_pass,data,string,
-mqtt_client_id,data,string,apm_000001
-
+mqtt_client_id,data,string,node_wm_001
+water_slave_id,data,u32,16
+water_baudrate,data,u32,9600
+water_poll_ms,data,u32,2000
+water_report_s,data,u32,15
 
